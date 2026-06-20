@@ -9,6 +9,10 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  StringSelectMenuBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   PermissionsBitField,
   ApplicationCommandOptionType,
   ChannelType,
@@ -16,19 +20,28 @@ const {
 
 const DATA_FILE = "./data.json";
 
+// Время стрелы считается по UTC+3.
+// Если нужно поменять, добавь в .env:
+// EVENT_TIMEZONE_OFFSET_MINUTES=180
+const EVENT_TIMEZONE_OFFSET_MINUTES = Number(
+  process.env.EVENT_TIMEZONE_OFFSET_MINUTES || 180
+);
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
   ],
 });
 
-const strely = new Map();
+const events = new Map();
 
 let data = {
   blacklist: {},
   antiDeleteChannels: {},
+  privateRooms: {},
 };
 
 if (fs.existsSync(DATA_FILE)) {
@@ -36,13 +49,14 @@ if (fs.existsSync(DATA_FILE)) {
 
   if (!data.blacklist) data.blacklist = {};
   if (!data.antiDeleteChannels) data.antiDeleteChannels = {};
+  if (!data.privateRooms) data.privateRooms = {};
 }
 
 function saveData() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
-client.once("clientReady", async () => {
+client.once("ready", async () => {
   console.log(`Бот запущен как ${client.user.tag}`);
 
   for (const guild of client.guilds.cache.values()) {
@@ -86,6 +100,10 @@ client.once("clientReady", async () => {
       {
         name: "antidel",
         description: "Включить или выключить автоудаление сообщений в этом канале",
+      },
+      {
+        name: "rooms",
+        description: "Создать панель приватных голосовых комнат",
       },
       {
         name: "redakt",
@@ -202,17 +220,13 @@ function hasAdmin(member) {
 }
 
 function hasDeputyOrHigher(member) {
-  if (hasAdmin(member)) {
-    return true;
-  }
+  if (hasAdmin(member)) return true;
 
   const deputyRole = member.guild.roles.cache.find(
     (role) => role.name.toLowerCase() === "deputy"
   );
 
-  if (!deputyRole) {
-    return false;
-  }
+  if (!deputyRole) return false;
 
   return member.roles.cache.some((role) => role.position >= deputyRole.position);
 }
@@ -226,9 +240,7 @@ function isBlacklisted(server, userId) {
 
   const serverKey = normalizeServerName(server);
 
-  if (!data.blacklist[serverKey]) {
-    return false;
-  }
+  if (!data.blacklist[serverKey]) return false;
 
   return data.blacklist[serverKey].includes(userId);
 }
@@ -250,9 +262,7 @@ function addToBlacklist(server, userId) {
 function removeFromBlacklist(server, userId) {
   const serverKey = normalizeServerName(server);
 
-  if (!data.blacklist[serverKey]) {
-    return;
-  }
+  if (!data.blacklist[serverKey]) return;
 
   data.blacklist[serverKey] = data.blacklist[serverKey].filter(
     (id) => id !== userId
@@ -266,13 +276,11 @@ function getChannelKey(guildId, channelId) {
 }
 
 function isAntiDeleteEnabled(guildId, channelId) {
-  const key = getChannelKey(guildId, channelId);
-  return data.antiDeleteChannels[key] === true;
+  return data.antiDeleteChannels[getChannelKey(guildId, channelId)] === true;
 }
 
 function setAntiDelete(guildId, channelId, value) {
-  const key = getChannelKey(guildId, channelId);
-  data.antiDeleteChannels[key] = value;
+  data.antiDeleteChannels[getChannelKey(guildId, channelId)] = value;
   saveData();
 }
 
@@ -286,7 +294,7 @@ function getField(text, fieldName) {
 }
 
 function parseEventTime(timeText) {
-  const match = timeText.match(/^(\d{1,2}):(\d{2})$/);
+  const match = String(timeText).match(/^(\d{1,2}):(\d{2})$/);
 
   if (!match) return null;
 
@@ -297,14 +305,25 @@ function parseEventTime(timeText) {
     return null;
   }
 
-  const date = new Date();
-  date.setHours(hours, minutes, 0, 0);
+  const nowUtc = new Date();
 
-  if (date.getTime() < Date.now()) {
-    date.setDate(date.getDate() + 1);
+  const nowInEventTimezone = new Date(
+    nowUtc.getTime() + EVENT_TIMEZONE_OFFSET_MINUTES * 60 * 1000
+  );
+
+  const year = nowInEventTimezone.getUTCFullYear();
+  const month = nowInEventTimezone.getUTCMonth();
+  const day = nowInEventTimezone.getUTCDate();
+
+  let eventUtcMs =
+    Date.UTC(year, month, day, hours, minutes, 0, 0) -
+    EVENT_TIMEZONE_OFFSET_MINUTES * 60 * 1000;
+
+  if (eventUtcMs <= Date.now()) {
+    eventUtcMs += 24 * 60 * 60 * 1000;
   }
 
-  return date;
+  return new Date(eventUtcMs);
 }
 
 function minutesBeforeEvent(eventItem) {
@@ -318,21 +337,10 @@ function isSpecialEvent(eventItem) {
 }
 
 function getEventTitle(eventItem) {
-  if (eventItem.type === "strela") {
-    return "Запись на стрелу";
-  }
-
-  if (eventItem.type === "fw") {
-    return "Пик слотов на ФВ";
-  }
-
-  if (eventItem.type === "neft") {
-    return "Пик слотов на нефтевышки";
-  }
-
-  if (eventItem.type === "priton") {
-    return "Пик слотов на притон";
-  }
+  if (eventItem.type === "strela") return "Запись на стрелу";
+  if (eventItem.type === "fw") return "Пик слотов на ФВ";
+  if (eventItem.type === "neft") return "Пик слотов на нефтевышки";
+  if (eventItem.type === "priton") return "Пик слотов на притон";
 
   return "Пик слотов";
 }
@@ -375,7 +383,8 @@ function buildDecideEmbed(eventItem) {
       },
       {
         name: "Статус",
-        value: "Создатель слотов должен выбрать формат: 2/2, 3/3, 4/4 или 5/5.",
+        value:
+          "Создатель слотов должен выбрать формат: 2/2, 3/3, 4/4 или 5/5.",
       }
     )
     .setFooter({
@@ -391,7 +400,7 @@ function buildStrelaEmbed(eventItem) {
           .join("\n")
       : "Пока никто не пикнул слот.";
 
-  const replaces =
+  const replacements =
     eventItem.replacements.length > 0
       ? eventItem.replacements
           .map((userId, index) => `**Замена ${index + 1}** — <@${userId}>`)
@@ -433,7 +442,7 @@ function buildStrelaEmbed(eventItem) {
       },
       {
         name: "Замена",
-        value: replaces,
+        value: replacements,
       }
     )
     .setFooter({
@@ -527,10 +536,7 @@ function buildDecideButtons() {
     .setLabel("ОТПИКНУТЬ СЛОТ")
     .setStyle(ButtonStyle.Danger);
 
-  const row1 = new ActionRowBuilder().addComponents(
-    pickButton,
-    unpickButton
-  );
+  const row1 = new ActionRowBuilder().addComponents(pickButton, unpickButton);
 
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -612,11 +618,11 @@ function buildSpecialButtons() {
 
 function buildButtons(eventItem) {
   if (eventItem.mode === "decide") {
-    return buildDecideButtons(eventItem);
+    return buildDecideButtons();
   }
 
   if (isSpecialEvent(eventItem)) {
-    return buildSpecialButtons(eventItem);
+    return buildSpecialButtons();
   }
 
   return buildStrelaButtons(eventItem);
@@ -640,9 +646,7 @@ async function promoteFirstReplacement(eventItem) {
   try {
     const user = await client.users.fetch(promotedUserId);
 
-    await user.send(
-      "ОСНОВНОЙ ИГРОК НЕ СМОЖЕТ - ТЫ ИДЕШЬ НА МЕТКУ"
-    );
+    await user.send("ОСНОВНОЙ ИГРОК НЕ СМОЖЕТ - ТЫ ИДЕШЬ НА МЕТКУ");
   } catch (error) {
     console.log(`Не удалось отправить ЛС пользователю ${promotedUserId}`);
   }
@@ -675,9 +679,7 @@ function scheduleCreatorTwoHourReminder(eventItem) {
   const remindTime = eventItem.eventDate.getTime() - 2 * 60 * 60 * 1000;
   const delay = remindTime - Date.now();
 
-  if (delay <= 0) {
-    return;
-  }
+  if (delay <= 0) return;
 
   setTimeout(async () => {
     if (eventItem.mode !== "decide") return;
@@ -695,6 +697,7 @@ function scheduleCreatorTwoHourReminder(eventItem) {
 }
 
 async function createTemporaryVoiceChannel(eventItem) {
+  if (eventItem.type !== "strela") return;
   if (!eventItem.guildId) return;
   if (!eventItem.channelId) return;
   if (!eventItem.limit) return;
@@ -704,21 +707,26 @@ async function createTemporaryVoiceChannel(eventItem) {
 
   try {
     const guild = await client.guilds.fetch(eventItem.guildId);
-    const textChannel = await guild.channels.fetch(eventItem.channelId).catch(() => null);
+    const textChannel = await guild.channels
+      .fetch(eventItem.channelId)
+      .catch(() => null);
 
-    const timePart = eventItem.timeText
-      ? eventItem.timeText.replace(":", "-")
-      : "time";
+    const serverPart = eventItem.server || "server";
+    const timePart = eventItem.timeText || "time";
 
-    const channelName = `метка-${timePart}-${eventItem.players.length}-${eventItem.limit}`;
+    const channelName = `${timePart} ${serverPart}`.slice(0, 90);
 
     const voiceChannel = await guild.channels.create({
       name: channelName,
       type: ChannelType.GuildVoice,
       userLimit: eventItem.limit,
       parent: textChannel && textChannel.parentId ? textChannel.parentId : null,
-      reason: "Временный голосовой канал для стрелы",
+      reason: "Временный голосовой канал за 10 минут до стрелы",
     });
+
+    console.log(
+      `Создан временный голосовой канал ${channelName} с лимитом ${eventItem.limit}`
+    );
 
     setTimeout(async () => {
       try {
@@ -728,15 +736,13 @@ async function createTemporaryVoiceChannel(eventItem) {
       }
     }, 2 * 60 * 60 * 1000);
   } catch (error) {
-    console.log("Не удалось создать временный голосовой канал");
+    console.log("Не удалось создать временный голосовой канал:", error);
   }
 }
 
 function getAllUsersForReminder(eventItem) {
   if (isSpecialEvent(eventItem)) {
-    return [
-      ...new Set(eventItem.specialPlayers.map((player) => player.userId)),
-    ];
+    return [...new Set(eventItem.specialPlayers.map((player) => player.userId))];
   }
 
   return [
@@ -752,10 +758,15 @@ function scheduleTenMinuteActions(eventItem) {
   if (!eventItem.eventDate) return;
 
   const remindTime = eventItem.eventDate.getTime() - 10 * 60 * 1000;
-  const delay = remindTime - Date.now();
 
-  if (delay <= 0) {
+  let delay = remindTime - Date.now();
+
+  if (eventItem.eventDate.getTime() <= Date.now()) {
     return;
+  }
+
+  if (delay < 0) {
+    delay = 1000;
   }
 
   setTimeout(async () => {
@@ -775,6 +786,541 @@ function scheduleTenMinuteActions(eventItem) {
 
     await createTemporaryVoiceChannel(eventItem);
   }, delay);
+}
+
+function getPrivateRoom(channelId) {
+  return data.privateRooms[channelId] || null;
+}
+
+function setPrivateRoom(channel, ownerId) {
+  data.privateRooms[channel.id] = {
+    ownerId,
+    guildId: channel.guild.id,
+    createdAt: Date.now(),
+  };
+
+  saveData();
+}
+
+function deletePrivateRoomData(channelId) {
+  if (!data.privateRooms[channelId]) return;
+
+  delete data.privateRooms[channelId];
+  saveData();
+}
+
+function findUserPrivateRoom(guild, userId) {
+  const found = Object.entries(data.privateRooms).find(([, room]) => {
+    return room.guildId === guild.id && room.ownerId === userId;
+  });
+
+  if (!found) return null;
+
+  return guild.channels.cache.get(found[0]) || null;
+}
+
+function getUserCurrentPrivateRoom(member) {
+  const channel = member.voice.channel;
+
+  if (!channel) return null;
+
+  const room = getPrivateRoom(channel.id);
+
+  if (!room) return null;
+
+  return {
+    channel,
+    room,
+  };
+}
+
+function isPrivateRoomOwner(member) {
+  const current = getUserCurrentPrivateRoom(member);
+
+  if (!current) return false;
+
+  return current.room.ownerId === member.id || hasAdmin(member);
+}
+
+function buildPrivateRoomsEmbed() {
+  return new EmbedBuilder()
+    .setTitle("⚙️ Приватные комнаты")
+    .setColor(0x00b7ff)
+    .setDescription(
+      [
+        "Измените конфигурацию вашей комнаты с помощью панели управления.",
+        "",
+        "👑 — назначить нового создателя комнаты",
+        "🔒 — ограничить / выдать доступ к комнате",
+        "👥 — задать новый лимит участников",
+        "🔐 — закрыть / открыть комнату",
+        "✏️ — изменить название комнаты",
+        "👁️ — скрыть / открыть комнату",
+        "➡️ — выгнать участника из комнаты",
+        "🎙️ — ограничить / выдать право говорить",
+      ].join("\n")
+    )
+    .setFooter({
+      text: "Приватные комнаты",
+    })
+    .setTimestamp();
+}
+
+function buildPrivateRoomsComponents() {
+  const select = new StringSelectMenuBuilder()
+    .setCustomId("private_action")
+    .setPlaceholder("Выбрать активность")
+    .addOptions(
+      {
+        label: "Создать приватную комнату",
+        value: "create",
+        emoji: "➕",
+      },
+      {
+        label: "Назначить нового создателя",
+        value: "transfer",
+        emoji: "👑",
+      },
+      {
+        label: "Ограничить / выдать доступ",
+        value: "lock",
+        emoji: "🔒",
+      },
+      {
+        label: "Задать лимит участников",
+        value: "limit",
+        emoji: "👥",
+      },
+      {
+        label: "Закрыть / открыть комнату",
+        value: "close",
+        emoji: "🔐",
+      },
+      {
+        label: "Изменить название",
+        value: "rename",
+        emoji: "✏️",
+      },
+      {
+        label: "Скрыть / открыть комнату",
+        value: "hide",
+        emoji: "👁️",
+      },
+      {
+        label: "Выгнать участника",
+        value: "kick",
+        emoji: "➡️",
+      },
+      {
+        label: "Ограничить / выдать право говорить",
+        value: "speak",
+        emoji: "🎙️",
+      }
+    );
+
+  const rowSelect = new ActionRowBuilder().addComponents(select);
+
+  const row1 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("private_transfer")
+      .setEmoji("👑")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("private_lock")
+      .setEmoji("🔒")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("private_limit")
+      .setEmoji("👥")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("private_close")
+      .setEmoji("🔐")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const row2 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("private_rename")
+      .setEmoji("✏️")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("private_hide")
+      .setEmoji("👁️")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("private_kick")
+      .setEmoji("➡️")
+      .setStyle(ButtonStyle.Secondary),
+
+    new ButtonBuilder()
+      .setCustomId("private_speak")
+      .setEmoji("🎙️")
+      .setStyle(ButtonStyle.Secondary)
+  );
+
+  const row3 = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId("private_create")
+      .setLabel("Создать канал")
+      .setStyle(ButtonStyle.Success)
+  );
+
+  return [rowSelect, row1, row2, row3];
+}
+
+async function sendPrivateRoomsPanel(interaction) {
+  await interaction.channel.send({
+    embeds: [buildPrivateRoomsEmbed()],
+    components: buildPrivateRoomsComponents(),
+  });
+
+  return interaction.reply({
+    content: "Панель приватных комнат создана.",
+    ephemeral: true,
+  });
+}
+
+async function createPrivateVoiceRoom(interaction) {
+  const member = interaction.member;
+
+  const existingRoom = findUserPrivateRoom(interaction.guild, member.id);
+
+  if (existingRoom) {
+    return interaction.reply({
+      content: `У тебя уже есть приватная комната: <#${existingRoom.id}>.`,
+      ephemeral: true,
+    });
+  }
+
+  const parentId = interaction.channel.parentId || null;
+
+  const safeName =
+    member.displayName.replace(/[\\/#]/g, "").slice(0, 20) || "user";
+
+  const voiceChannel = await interaction.guild.channels.create({
+    name: `🔊・${safeName}`,
+    type: ChannelType.GuildVoice,
+    parent: parentId,
+    userLimit: 0,
+    permissionOverwrites: [
+      {
+        id: interaction.guild.roles.everyone.id,
+        allow: [
+          PermissionsBitField.Flags.ViewChannel,
+          PermissionsBitField.Flags.Connect,
+          PermissionsBitField.Flags.Speak,
+        ],
+      },
+      {
+        id: member.id,
+        allow: [
+          PermissionsBitField.Flags.ViewChannel,
+          PermissionsBitField.Flags.Connect,
+          PermissionsBitField.Flags.Speak,
+          PermissionsBitField.Flags.MoveMembers,
+          PermissionsBitField.Flags.ManageChannels,
+        ],
+      },
+    ],
+    reason: "Создание приватной комнаты",
+  });
+
+  setPrivateRoom(voiceChannel, member.id);
+
+  if (member.voice.channel) {
+    await member.voice.setChannel(voiceChannel).catch(() => null);
+  }
+
+  return interaction.reply({
+    content: `Приватная комната создана: <#${voiceChannel.id}>.`,
+    ephemeral: true,
+  });
+}
+
+async function ensureRoomOwnerReply(interaction) {
+  if (isPrivateRoomOwner(interaction.member)) return true;
+
+  await interaction.reply({
+    content:
+      "Ты должен находиться в своей приватной комнате. Управлять комнатой может только её создатель или администратор.",
+    ephemeral: true,
+  });
+
+  return false;
+}
+
+function createTextModal(customId, title, inputId, label, placeholder) {
+  const input = new TextInputBuilder()
+    .setCustomId(inputId)
+    .setLabel(label)
+    .setPlaceholder(placeholder)
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true);
+
+  return new ModalBuilder()
+    .setCustomId(customId)
+    .setTitle(title)
+    .addComponents(new ActionRowBuilder().addComponents(input));
+}
+
+async function toggleRoomConnect(interaction) {
+  if (!(await ensureRoomOwnerReply(interaction))) return;
+
+  const { channel } = getUserCurrentPrivateRoom(interaction.member);
+  const everyoneId = interaction.guild.roles.everyone.id;
+  const overwrite = channel.permissionOverwrites.cache.get(everyoneId);
+
+  const isClosed =
+    overwrite && overwrite.deny.has(PermissionsBitField.Flags.Connect);
+
+  await channel.permissionOverwrites.edit(everyoneId, {
+    Connect: isClosed ? null : false,
+  });
+
+  return interaction.reply({
+    content: isClosed
+      ? "Комната открыта для входа."
+      : "Комната закрыта для входа.",
+    ephemeral: true,
+  });
+}
+
+async function toggleRoomView(interaction) {
+  if (!(await ensureRoomOwnerReply(interaction))) return;
+
+  const { channel } = getUserCurrentPrivateRoom(interaction.member);
+  const everyoneId = interaction.guild.roles.everyone.id;
+  const overwrite = channel.permissionOverwrites.cache.get(everyoneId);
+
+  const isHidden =
+    overwrite && overwrite.deny.has(PermissionsBitField.Flags.ViewChannel);
+
+  await channel.permissionOverwrites.edit(everyoneId, {
+    ViewChannel: isHidden ? null : false,
+  });
+
+  return interaction.reply({
+    content: isHidden ? "Комната снова видна." : "Комната скрыта.",
+    ephemeral: true,
+  });
+}
+
+async function toggleRoomSpeak(interaction) {
+  if (!(await ensureRoomOwnerReply(interaction))) return;
+
+  const { channel } = getUserCurrentPrivateRoom(interaction.member);
+  const everyoneId = interaction.guild.roles.everyone.id;
+  const overwrite = channel.permissionOverwrites.cache.get(everyoneId);
+
+  const isMuted =
+    overwrite && overwrite.deny.has(PermissionsBitField.Flags.Speak);
+
+  await channel.permissionOverwrites.edit(everyoneId, {
+    Speak: isMuted ? null : false,
+  });
+
+  return interaction.reply({
+    content: isMuted
+      ? "Право говорить выдано обратно."
+      : "Право говорить ограничено.",
+    ephemeral: true,
+  });
+}
+
+async function handlePrivateAction(interaction, action) {
+  if (action === "create") {
+    return createPrivateVoiceRoom(interaction);
+  }
+
+  if (action === "lock" || action === "close") {
+    return toggleRoomConnect(interaction);
+  }
+
+  if (action === "hide") {
+    return toggleRoomView(interaction);
+  }
+
+  if (action === "speak") {
+    return toggleRoomSpeak(interaction);
+  }
+
+  if (!(await ensureRoomOwnerReply(interaction))) return;
+
+  if (action === "limit") {
+    return interaction.showModal(
+      createTextModal(
+        "private_limit_modal",
+        "Лимит участников",
+        "limit",
+        "Новый лимит",
+        "Например: 5. Для безлимита: 0"
+      )
+    );
+  }
+
+  if (action === "rename") {
+    return interaction.showModal(
+      createTextModal(
+        "private_rename_modal",
+        "Название комнаты",
+        "name",
+        "Новое название",
+        "Например: Комната мафии"
+      )
+    );
+  }
+
+  if (action === "transfer") {
+    return interaction.showModal(
+      createTextModal(
+        "private_transfer_modal",
+        "Новый создатель",
+        "user",
+        "ID или упоминание пользователя",
+        "Например: 123456789012345678"
+      )
+    );
+  }
+
+  if (action === "kick") {
+    return interaction.showModal(
+      createTextModal(
+        "private_kick_modal",
+        "Выгнать участника",
+        "user",
+        "ID или упоминание пользователя",
+        "Например: 123456789012345678"
+      )
+    );
+  }
+}
+
+function parseUserId(text) {
+  const match = String(text).match(/\d{15,25}/);
+  return match ? match[0] : null;
+}
+
+async function handlePrivateRoomModal(interaction) {
+  if (!(await ensureRoomOwnerReply(interaction))) return;
+
+  const { channel } = getUserCurrentPrivateRoom(interaction.member);
+
+  if (interaction.customId === "private_limit_modal") {
+    const limit = Number(interaction.fields.getTextInputValue("limit"));
+
+    if (!Number.isInteger(limit) || limit < 0 || limit > 99) {
+      return interaction.reply({
+        content: "Лимит должен быть числом от 0 до 99. 0 = без лимита.",
+        ephemeral: true,
+      });
+    }
+
+    await channel.setUserLimit(limit);
+
+    return interaction.reply({
+      content:
+        limit === 0
+          ? "Лимит комнаты убран."
+          : `Лимит комнаты установлен: ${limit}.`,
+      ephemeral: true,
+    });
+  }
+
+  if (interaction.customId === "private_rename_modal") {
+    const name = interaction.fields
+      .getTextInputValue("name")
+      .trim()
+      .slice(0, 90);
+
+    if (!name) {
+      return interaction.reply({
+        content: "Название не может быть пустым.",
+        ephemeral: true,
+      });
+    }
+
+    await channel.setName(name, "Изменение названия приватной комнаты");
+
+    return interaction.reply({
+      content: `Название изменено на **${name}**.`,
+      ephemeral: true,
+    });
+  }
+
+  if (interaction.customId === "private_transfer_modal") {
+    const userId = parseUserId(interaction.fields.getTextInputValue("user"));
+
+    if (!userId) {
+      return interaction.reply({
+        content: "Я не смог найти ID пользователя.",
+        ephemeral: true,
+      });
+    }
+
+    const member = await interaction.guild.members
+      .fetch(userId)
+      .catch(() => null);
+
+    if (!member) {
+      return interaction.reply({
+        content: "Такого пользователя нет на сервере.",
+        ephemeral: true,
+      });
+    }
+
+    data.privateRooms[channel.id].ownerId = member.id;
+    saveData();
+
+    await channel.permissionOverwrites.edit(member.id, {
+      ViewChannel: true,
+      Connect: true,
+      Speak: true,
+      MoveMembers: true,
+      ManageChannels: true,
+    });
+
+    return interaction.reply({
+      content: `<@${member.id}> теперь создатель комнаты.`,
+      ephemeral: true,
+    });
+  }
+
+  if (interaction.customId === "private_kick_modal") {
+    const userId = parseUserId(interaction.fields.getTextInputValue("user"));
+
+    if (!userId) {
+      return interaction.reply({
+        content: "Я не смог найти ID пользователя.",
+        ephemeral: true,
+      });
+    }
+
+    const member = await interaction.guild.members
+      .fetch(userId)
+      .catch(() => null);
+
+    if (!member || !member.voice.channel || member.voice.channel.id !== channel.id) {
+      return interaction.reply({
+        content: "Этот пользователь сейчас не находится в твоей комнате.",
+        ephemeral: true,
+      });
+    }
+
+    await member.voice
+      .disconnect("Выгнан создателем приватной комнаты")
+      .catch(() => null);
+
+    return interaction.reply({
+      content: `<@${member.id}> выгнан из комнаты.`,
+      ephemeral: true,
+    });
+  }
 }
 
 async function sendHelp(message) {
@@ -805,6 +1351,7 @@ async function sendHelp(message) {
       "**/fw** — пик слотов на ФВ. Поля: `time`, `against`.",
       "**/neft** — пик слотов на нефтевышки. Поля: `organizations`, `server`.",
       "**/priton** — пик слотов на притон. Поля: `organizations`, `server`.",
+      "**/rooms** — создать панель приватных голосовых комнат.",
       "",
       "Для `/fw`, `/neft`, `/priton` кнопки:",
       "`ПИКНУТЬ СЛОТ (БЕЗ СЕТА)`",
@@ -841,7 +1388,7 @@ async function handleLimitCommand(message) {
   }
 
   const targetMessageId = message.reference.messageId;
-  const eventItem = strely.get(targetMessageId);
+  const eventItem = events.get(targetMessageId);
 
   if (!eventItem) {
     return message.reply("Не нашёл активные слоты в этом сообщении.");
@@ -868,8 +1415,8 @@ async function handleLimitCommand(message) {
   eventItem.limit = newLimit;
 
   const targetMessage = await message.channel.messages.fetch(targetMessageId);
-  await updateEventMessage(targetMessage, eventItem);
 
+  await updateEventMessage(targetMessage, eventItem);
   await message.delete().catch(() => {});
 }
 
@@ -927,7 +1474,7 @@ async function handleCreateStrela(message) {
       components: buildButtons(eventItem),
     });
 
-    strely.set(sentMessage.id, eventItem);
+    events.set(sentMessage.id, eventItem);
 
     setAntiDelete(message.guild.id, message.channel.id, true);
     scheduleCreatorTwoHourReminder(eventItem);
@@ -981,7 +1528,7 @@ async function handleCreateStrela(message) {
     components: buildButtons(eventItem),
   });
 
-  strely.set(sentMessage.id, eventItem);
+  events.set(sentMessage.id, eventItem);
 
   setAntiDelete(message.guild.id, message.channel.id, true);
   scheduleTenMinuteActions(eventItem);
@@ -1000,7 +1547,7 @@ async function createSlashSlotEvent(interaction, eventItem) {
     components: buildButtons(eventItem),
   });
 
-  strely.set(sentMessage.id, eventItem);
+  events.set(sentMessage.id, eventItem);
 
   setAntiDelete(interaction.guild.id, interaction.channel.id, true);
   scheduleTenMinuteActions(eventItem);
@@ -1038,11 +1585,9 @@ function removeUserFromEvent(eventItem, userId) {
 
 function findEditableEvent(interaction, messageId) {
   if (messageId) {
-    const eventItem = strely.get(messageId);
+    const eventItem = events.get(messageId);
 
-    if (!eventItem) {
-      return null;
-    }
+    if (!eventItem) return null;
 
     return {
       messageId,
@@ -1050,18 +1595,16 @@ function findEditableEvent(interaction, messageId) {
     };
   }
 
-  const events = Array.from(strely.entries()).reverse();
+  const allEvents = Array.from(events.entries()).reverse();
 
-  const found = events.find(([, eventItem]) => {
+  const found = allEvents.find(([, eventItem]) => {
     return (
       eventItem.channelId === interaction.channel.id &&
       eventItem.createdById === interaction.user.id
     );
   });
 
-  if (!found) {
-    return null;
-  }
+  if (!found) return null;
 
   return {
     messageId: found[0],
@@ -1088,7 +1631,8 @@ async function handleRedaktCommand(interaction) {
 
   if (eventItem.createdById !== interaction.user.id) {
     return interaction.reply({
-      content: "Редактировать состав может только человек, который создал эти слоты.",
+      content:
+        "Редактировать состав может только человек, который создал эти слоты.",
       ephemeral: true,
     });
   }
@@ -1204,6 +1748,17 @@ client.on("messageCreate", async (message) => {
 
 client.on("interactionCreate", async (interaction) => {
   if (interaction.isChatInputCommand()) {
+    if (interaction.commandName === "rooms") {
+      if (!hasDeputyOrHigher(interaction.member)) {
+        return interaction.reply({
+          content: "Создать панель приватных комнат может только роль deputy или выше.",
+          ephemeral: true,
+        });
+      }
+
+      return sendPrivateRoomsPanel(interaction);
+    }
+
     if (interaction.commandName === "redakt") {
       return handleRedaktCommand(interaction);
     }
@@ -1371,9 +1926,26 @@ client.on("interactionCreate", async (interaction) => {
     }
   }
 
+  if (interaction.isModalSubmit()) {
+    if (interaction.customId.startsWith("private_")) {
+      return handlePrivateRoomModal(interaction);
+    }
+  }
+
+  if (interaction.isStringSelectMenu()) {
+    if (interaction.customId === "private_action") {
+      return handlePrivateAction(interaction, interaction.values[0]);
+    }
+  }
+
   if (!interaction.isButton()) return;
 
-  const eventItem = strely.get(interaction.message.id);
+  if (interaction.customId.startsWith("private_")) {
+    const action = interaction.customId.replace("private_", "");
+    return handlePrivateAction(interaction, action);
+  }
+
+  const eventItem = events.get(interaction.message.id);
 
   if (!eventItem) {
     return interaction.reply({
@@ -1540,7 +2112,6 @@ client.on("interactionCreate", async (interaction) => {
       eventItem.players = eventItem.players.filter((id) => id !== userId);
 
       await promoteFirstReplacement(eventItem);
-
       await updateEventMessage(interaction.message, eventItem);
 
       return interaction.reply({
@@ -1591,6 +2162,22 @@ client.on("interactionCreate", async (interaction) => {
       content: "Ты записан на замену.",
       ephemeral: true,
     });
+  }
+});
+
+client.on("voiceStateUpdate", async (oldState) => {
+  const oldChannel = oldState.channel;
+
+  if (!oldChannel) return;
+
+  const room = getPrivateRoom(oldChannel.id);
+
+  if (!room) return;
+
+  if (oldChannel.members.size === 0) {
+    deletePrivateRoomData(oldChannel.id);
+
+    await oldChannel.delete("Приватная комната пуста").catch(() => null);
   }
 });
 
