@@ -11,6 +11,7 @@ const {
   ButtonStyle,
   PermissionsBitField,
   ApplicationCommandOptionType,
+  Events,
 } = require("discord.js");
 
 const DATA_FILE = "./data.json";
@@ -28,20 +29,80 @@ const strely = new Map();
 let data = {
   blacklist: {},
   antiDeleteChannels: {},
+  activeEvents: {},
 };
 
-if (fs.existsSync(DATA_FILE)) {
-  data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+function loadData() {
+  if (!fs.existsSync(DATA_FILE)) return;
 
-  if (!data.blacklist) data.blacklist = {};
-  if (!data.antiDeleteChannels) data.antiDeleteChannels = {};
+  try {
+    const loaded = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+
+    data.blacklist = loaded.blacklist || {};
+    data.antiDeleteChannels = loaded.antiDeleteChannels || {};
+    data.activeEvents = loaded.activeEvents || {};
+  } catch (error) {
+    console.log("Ошибка чтения data.json:", error);
+    data = {
+      blacklist: {},
+      antiDeleteChannels: {},
+      activeEvents: {},
+    };
+  }
 }
 
 function saveData() {
   fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
 }
 
-client.once("clientReady", async () => {
+function serializeEvent(eventItem) {
+  return {
+    ...eventItem,
+    eventDate: eventItem.eventDate ? eventItem.eventDate.toISOString() : null,
+  };
+}
+
+function deserializeEvent(eventItem) {
+  return {
+    ...eventItem,
+    eventDate: eventItem.eventDate ? new Date(eventItem.eventDate) : null,
+  };
+}
+
+function saveActiveEvents() {
+  data.activeEvents = {};
+
+  for (const [messageId, eventItem] of strely.entries()) {
+    data.activeEvents[messageId] = serializeEvent(eventItem);
+  }
+
+  saveData();
+}
+
+function restoreActiveEvents() {
+  strely.clear();
+
+  for (const [messageId, eventItem] of Object.entries(data.activeEvents || {})) {
+    strely.set(messageId, deserializeEvent(eventItem));
+  }
+
+  console.log(`Восстановлено активных записей: ${strely.size}`);
+}
+
+function deleteActiveEvent(messageId) {
+  strely.delete(messageId);
+
+  if (data.activeEvents) {
+    delete data.activeEvents[messageId];
+  }
+
+  saveData();
+}
+
+loadData();
+restoreActiveEvents();
+
+client.once(Events.ClientReady, async () => {
   console.log(`Бот запущен как ${client.user.tag}`);
 
   for (const guild of client.guilds.cache.values()) {
@@ -96,30 +157,12 @@ client.once("clientReady", async () => {
             type: ApplicationCommandOptionType.String,
             required: true,
             choices: [
-              {
-                name: "Добавить в основу",
-                value: "add_main",
-              },
-              {
-                name: "Добавить в замену",
-                value: "add_replace",
-              },
-              {
-                name: "Добавить без сета",
-                value: "add_no_set",
-              },
-              {
-                name: "Добавить с сетом",
-                value: "add_with_set",
-              },
-              {
-                name: "Сет оплачен",
-                value: "set_paid",
-              },
-              {
-                name: "Убрать из состава",
-                value: "remove",
-              },
+              { name: "Добавить в основу", value: "add_main" },
+              { name: "Добавить в замену", value: "add_replace" },
+              { name: "Добавить без сета", value: "add_no_set" },
+              { name: "Добавить с сетом", value: "add_with_set" },
+              { name: "Сет оплачен", value: "set_paid" },
+              { name: "Убрать из состава", value: "remove" },
             ],
           },
           {
@@ -193,6 +236,11 @@ client.once("clientReady", async () => {
     ]);
   }
 
+  for (const [, eventItem] of strely.entries()) {
+    scheduleCreatorTwoHourReminder(eventItem);
+    scheduleTenMinuteActions(eventItem);
+  }
+
   console.log("Slash-команды зарегистрированы");
 });
 
@@ -201,17 +249,13 @@ function hasAdmin(member) {
 }
 
 function hasDeputyOrHigher(member) {
-  if (hasAdmin(member)) {
-    return true;
-  }
+  if (hasAdmin(member)) return true;
 
   const deputyRole = member.guild.roles.cache.find(
     (role) => role.name.toLowerCase() === "deputy"
   );
 
-  if (!deputyRole) {
-    return false;
-  }
+  if (!deputyRole) return false;
 
   return member.roles.cache.some((role) => role.position >= deputyRole.position);
 }
@@ -225,9 +269,7 @@ function isBlacklisted(server, userId) {
 
   const serverKey = normalizeServerName(server);
 
-  if (!data.blacklist[serverKey]) {
-    return false;
-  }
+  if (!data.blacklist[serverKey]) return false;
 
   return data.blacklist[serverKey].includes(userId);
 }
@@ -249,9 +291,7 @@ function addToBlacklist(server, userId) {
 function removeFromBlacklist(server, userId) {
   const serverKey = normalizeServerName(server);
 
-  if (!data.blacklist[serverKey]) {
-    return;
-  }
+  if (!data.blacklist[serverKey]) return;
 
   data.blacklist[serverKey] = data.blacklist[serverKey].filter(
     (id) => id !== userId
@@ -292,9 +332,7 @@ function parseEventTime(timeText) {
   const hours = Number(match[1]);
   const minutes = Number(match[2]);
 
-  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
-    return null;
-  }
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) return null;
 
   const date = new Date();
   date.setHours(hours, minutes, 0, 0);
@@ -317,21 +355,10 @@ function isSpecialEvent(eventItem) {
 }
 
 function getEventTitle(eventItem) {
-  if (eventItem.type === "strela") {
-    return "Запись на стрелу";
-  }
-
-  if (eventItem.type === "fw") {
-    return "Пик слотов на ФВ";
-  }
-
-  if (eventItem.type === "neft") {
-    return "Пик слотов на нефтевышки";
-  }
-
-  if (eventItem.type === "priton") {
-    return "Пик слотов на притон";
-  }
+  if (eventItem.type === "strela") return "Запись на стрелу";
+  if (eventItem.type === "fw") return "Пик слотов на ФВ";
+  if (eventItem.type === "neft") return "Пик слотов на нефтевышки";
+  if (eventItem.type === "priton") return "Пик слотов на притон";
 
   return "Пик слотов";
 }
@@ -348,38 +375,17 @@ function buildDecideEmbed(eventItem) {
     .setTitle("Нам забили, решаем сколько слотов")
     .setColor(0xffa500)
     .addFields(
-      {
-        name: "Сервер",
-        value: eventItem.server,
-        inline: true,
-      },
-      {
-        name: "Карта",
-        value: eventItem.map,
-        inline: true,
-      },
-      {
-        name: "Оружие",
-        value: eventItem.weapon,
-        inline: true,
-      },
-      {
-        name: "Время",
-        value: eventItem.timeText,
-        inline: true,
-      },
-      {
-        name: "Пикнувшие люди",
-        value: picked,
-      },
+      { name: "Сервер", value: eventItem.server || "Не указан", inline: true },
+      { name: "Карта", value: eventItem.map || "Не указана", inline: true },
+      { name: "Оружие", value: eventItem.weapon || "Не указано", inline: true },
+      { name: "Время", value: eventItem.timeText || "Не указано", inline: true },
+      { name: "Пикнувшие люди", value: picked },
       {
         name: "Статус",
         value: "Создатель слотов должен выбрать формат: 2/2, 3/3, 4/4 или 5/5.",
       }
     )
-    .setFooter({
-      text: `Создал: ${eventItem.createdByTag}`,
-    });
+    .setFooter({ text: `Создал: ${eventItem.createdByTag}` });
 }
 
 function buildStrelaEmbed(eventItem) {
@@ -401,43 +407,15 @@ function buildStrelaEmbed(eventItem) {
     .setTitle("Запись на стрелу")
     .setColor(0x8b0000)
     .addFields(
-      {
-        name: "Сервер",
-        value: eventItem.server,
-        inline: true,
-      },
-      {
-        name: "Количество людей",
-        value: `${eventItem.limit}`,
-        inline: true,
-      },
-      {
-        name: "Карта",
-        value: eventItem.map,
-        inline: true,
-      },
-      {
-        name: "Оружие",
-        value: eventItem.weapon,
-        inline: true,
-      },
-      {
-        name: "Время",
-        value: eventItem.timeText,
-        inline: true,
-      },
-      {
-        name: "Основные слоты",
-        value: mainPlayers,
-      },
-      {
-        name: "Замена",
-        value: replaces,
-      }
+      { name: "Сервер", value: eventItem.server || "Не указан", inline: true },
+      { name: "Количество людей", value: `${eventItem.limit}`, inline: true },
+      { name: "Карта", value: eventItem.map || "Не указана", inline: true },
+      { name: "Оружие", value: eventItem.weapon || "Не указано", inline: true },
+      { name: "Время", value: eventItem.timeText || "Не указано", inline: true },
+      { name: "Основные слоты", value: mainPlayers },
+      { name: "Замена", value: replaces }
     )
-    .setFooter({
-      text: `Создал: ${eventItem.createdByTag}`,
-    });
+    .setFooter({ text: `Создал: ${eventItem.createdByTag}` });
 }
 
 function buildSpecialEmbed(eventItem) {
@@ -454,26 +432,13 @@ function buildSpecialEmbed(eventItem) {
   const embed = new EmbedBuilder()
     .setTitle(getEventTitle(eventItem))
     .setColor(0x8b0000)
-    .setFooter({
-      text: `Создал: ${eventItem.createdByTag}`,
-    });
+    .setFooter({ text: `Создал: ${eventItem.createdByTag}` });
 
   if (eventItem.type === "fw") {
     embed.addFields(
-      {
-        name: "Время",
-        value: eventItem.timeText,
-        inline: true,
-      },
-      {
-        name: "Против кого",
-        value: eventItem.against,
-        inline: true,
-      },
-      {
-        name: "Пикнувшие слоты",
-        value: players,
-      }
+      { name: "Время", value: eventItem.timeText || "Не указано", inline: true },
+      { name: "Против кого", value: eventItem.against || "Не указано", inline: true },
+      { name: "Пикнувшие слоты", value: players }
     );
 
     return embed;
@@ -483,18 +448,11 @@ function buildSpecialEmbed(eventItem) {
     embed.addFields(
       {
         name: "Организации",
-        value: eventItem.organizations,
+        value: eventItem.organizations || "Не указано",
         inline: true,
       },
-      {
-        name: "Сервер",
-        value: eventItem.server,
-        inline: true,
-      },
-      {
-        name: "Пикнувшие слоты",
-        value: players,
-      }
+      { name: "Сервер", value: eventItem.server || "Не указан", inline: true },
+      { name: "Пикнувшие слоты", value: players }
     );
 
     return embed;
@@ -504,13 +462,8 @@ function buildSpecialEmbed(eventItem) {
 }
 
 function buildEmbed(eventItem) {
-  if (eventItem.mode === "decide") {
-    return buildDecideEmbed(eventItem);
-  }
-
-  if (isSpecialEvent(eventItem)) {
-    return buildSpecialEmbed(eventItem);
-  }
+  if (eventItem.mode === "decide") return buildDecideEmbed(eventItem);
+  if (isSpecialEvent(eventItem)) return buildSpecialEmbed(eventItem);
 
   return buildStrelaEmbed(eventItem);
 }
@@ -526,10 +479,7 @@ function buildDecideButtons() {
     .setLabel("ОТПИКНУТЬ СЛОТ")
     .setStyle(ButtonStyle.Danger);
 
-  const row1 = new ActionRowBuilder().addComponents(
-    pickButton,
-    unpickButton
-  );
+  const row1 = new ActionRowBuilder().addComponents(pickButton, unpickButton);
 
   const row2 = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -610,13 +560,8 @@ function buildSpecialButtons() {
 }
 
 function buildButtons(eventItem) {
-  if (eventItem.mode === "decide") {
-    return buildDecideButtons(eventItem);
-  }
-
-  if (isSpecialEvent(eventItem)) {
-    return buildSpecialButtons(eventItem);
-  }
+  if (eventItem.mode === "decide") return buildDecideButtons();
+  if (isSpecialEvent(eventItem)) return buildSpecialButtons();
 
   return buildStrelaButtons(eventItem);
 }
@@ -626,12 +571,27 @@ async function updateEventMessage(message, eventItem) {
     embeds: [buildEmbed(eventItem)],
     components: buildButtons(eventItem),
   });
+
+  saveActiveEvents();
+}
+
+async function safeEditReply(interaction, content) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      return await interaction.editReply({ content });
+    }
+
+    return await interaction.reply({
+      content,
+      ephemeral: true,
+    });
+  } catch (error) {
+    console.log("Не удалось ответить на interaction:", error.message);
+  }
 }
 
 async function promoteFirstReplacement(eventItem) {
-  if (eventItem.replacements.length === 0) {
-    return null;
-  }
+  if (eventItem.replacements.length === 0) return null;
 
   const promotedUserId = eventItem.replacements.shift();
   eventItem.players.push(promotedUserId);
@@ -639,12 +599,12 @@ async function promoteFirstReplacement(eventItem) {
   try {
     const user = await client.users.fetch(promotedUserId);
 
-    await user.send(
-      "ОСНОВНОЙ ИГРОК НЕ СМОЖЕТ - ТЫ ИДЕШЬ НА МЕТКУ"
-    );
+    await user.send("ОСНОВНОЙ ИГРОК НЕ СМОЖЕТ - ТЫ ИДЕШЬ НА МЕТКУ");
   } catch (error) {
     console.log(`Не удалось отправить ЛС пользователю ${promotedUserId}`);
   }
+
+  saveActiveEvents();
 
   return promotedUserId;
 }
@@ -664,22 +624,29 @@ async function notifyCreatorAboutFive(eventItem) {
   } catch (error) {
     console.log(`Не удалось отправить ЛС создателю ${eventItem.createdById}`);
   }
+
+  saveActiveEvents();
 }
 
 function scheduleCreatorTwoHourReminder(eventItem) {
   if (eventItem.type !== "strela") return;
   if (eventItem.mode !== "decide") return;
   if (!eventItem.eventDate) return;
+  if (eventItem.creatorTwoHourReminderScheduled) return;
 
   const remindTime = eventItem.eventDate.getTime() - 2 * 60 * 60 * 1000;
   const delay = remindTime - Date.now();
 
-  if (delay <= 0) {
-    return;
-  }
+  if (delay <= 0) return;
+
+  eventItem.creatorTwoHourReminderScheduled = true;
+  saveActiveEvents();
 
   setTimeout(async () => {
     if (eventItem.mode !== "decide") return;
+    if (eventItem.creatorTwoHourNotified) return;
+
+    eventItem.creatorTwoHourNotified = true;
 
     try {
       const user = await client.users.fetch(eventItem.createdById);
@@ -690,14 +657,14 @@ function scheduleCreatorTwoHourReminder(eventItem) {
     } catch (error) {
       console.log(`Не удалось отправить ЛС создателю ${eventItem.createdById}`);
     }
+
+    saveActiveEvents();
   }, delay);
 }
 
 function getAllUsersForReminder(eventItem) {
   if (isSpecialEvent(eventItem)) {
-    return [
-      ...new Set(eventItem.specialPlayers.map((player) => player.userId)),
-    ];
+    return [...new Set(eventItem.specialPlayers.map((player) => player.userId))];
   }
 
   return [
@@ -711,15 +678,21 @@ function getAllUsersForReminder(eventItem) {
 
 function scheduleTenMinuteActions(eventItem) {
   if (!eventItem.eventDate) return;
+  if (eventItem.tenMinuteReminderScheduled) return;
 
   const remindTime = eventItem.eventDate.getTime() - 10 * 60 * 1000;
   const delay = remindTime - Date.now();
 
-  if (delay <= 0) {
-    return;
-  }
+  if (delay <= 0) return;
+
+  eventItem.tenMinuteReminderScheduled = true;
+  saveActiveEvents();
 
   setTimeout(async () => {
+    if (eventItem.tenMinuteNotified) return;
+
+    eventItem.tenMinuteNotified = true;
+
     const allUsers = getAllUsersForReminder(eventItem);
 
     for (const userId of allUsers) {
@@ -733,6 +706,8 @@ function scheduleTenMinuteActions(eventItem) {
         console.log(`Не удалось отправить ЛС пользователю ${userId}`);
       }
     }
+
+    saveActiveEvents();
   }, delay);
 }
 
@@ -878,6 +853,10 @@ async function handleCreateStrela(message) {
       guildId: message.guild.id,
       channelId: message.channel.id,
       fullFiveNotified: false,
+      creatorTwoHourNotified: false,
+      creatorTwoHourReminderScheduled: false,
+      tenMinuteNotified: false,
+      tenMinuteReminderScheduled: false,
     };
 
     const sentMessage = await message.channel.send({
@@ -886,6 +865,7 @@ async function handleCreateStrela(message) {
     });
 
     strely.set(sentMessage.id, eventItem);
+    saveActiveEvents();
 
     setAntiDelete(message.guild.id, message.channel.id, true);
     scheduleCreatorTwoHourReminder(eventItem);
@@ -931,6 +911,10 @@ async function handleCreateStrela(message) {
     guildId: message.guild.id,
     channelId: message.channel.id,
     fullFiveNotified: false,
+    creatorTwoHourNotified: false,
+    creatorTwoHourReminderScheduled: false,
+    tenMinuteNotified: false,
+    tenMinuteReminderScheduled: false,
   };
 
   const sentMessage = await message.channel.send({
@@ -939,6 +923,7 @@ async function handleCreateStrela(message) {
   });
 
   strely.set(sentMessage.id, eventItem);
+  saveActiveEvents();
 
   setAntiDelete(message.guild.id, message.channel.id, true);
   scheduleTenMinuteActions(eventItem);
@@ -952,19 +937,21 @@ async function createSlashSlotEvent(interaction, eventItem) {
     });
   }
 
+  await interaction.deferReply({ ephemeral: true });
+
   const sentMessage = await interaction.channel.send({
     embeds: [buildEmbed(eventItem)],
     components: buildButtons(eventItem),
   });
 
   strely.set(sentMessage.id, eventItem);
+  saveActiveEvents();
 
   setAntiDelete(interaction.guild.id, interaction.channel.id, true);
   scheduleTenMinuteActions(eventItem);
 
-  return interaction.reply({
+  return interaction.editReply({
     content: "Слоты созданы.",
-    ephemeral: true,
   });
 }
 
@@ -997,9 +984,7 @@ function findEditableEvent(interaction, messageId) {
   if (messageId) {
     const eventItem = strely.get(messageId);
 
-    if (!eventItem) {
-      return null;
-    }
+    if (!eventItem) return null;
 
     return {
       messageId,
@@ -1016,9 +1001,7 @@ function findEditableEvent(interaction, messageId) {
     );
   });
 
-  if (!found) {
-    return null;
-  }
+  if (!found) return null;
 
   return {
     messageId: found[0],
@@ -1027,6 +1010,8 @@ function findEditableEvent(interaction, messageId) {
 }
 
 async function handleRedaktCommand(interaction) {
+  await interaction.deferReply({ ephemeral: true });
+
   const action = interaction.options.getString("action");
   const user = interaction.options.getUser("user");
   const messageId = interaction.options.getString("message_id");
@@ -1034,19 +1019,17 @@ async function handleRedaktCommand(interaction) {
   const found = findEditableEvent(interaction, messageId);
 
   if (!found) {
-    return interaction.reply({
+    return interaction.editReply({
       content:
         "Не нашёл твою активную метку в этом канале. Попробуй указать `message_id` сообщения бота.",
-      ephemeral: true,
     });
   }
 
   const { eventItem } = found;
 
   if (eventItem.createdById !== interaction.user.id) {
-    return interaction.reply({
+    return interaction.editReply({
       content: "Редактировать состав может только человек, который создал эти слоты.",
-      ephemeral: true,
     });
   }
 
@@ -1054,10 +1037,9 @@ async function handleRedaktCommand(interaction) {
     removeUserFromEvent(eventItem, user.id);
   } else if (eventItem.mode === "decide") {
     if (action !== "add_main") {
-      return interaction.reply({
+      return interaction.editReply({
         content:
           "Для `!strela 2` до выбора формата можно использовать только `add_main` или `remove`.",
-        ephemeral: true,
       });
     }
 
@@ -1072,25 +1054,22 @@ async function handleRedaktCommand(interaction) {
     } else if (action === "set_paid") {
       setSpecialPlayerStatus(eventItem, user.id, "сет оплачен");
     } else {
-      return interaction.reply({
+      return interaction.editReply({
         content:
           "Для `/fw`, `/neft`, `/priton` используй `add_no_set`, `add_with_set`, `set_paid` или `remove`.",
-        ephemeral: true,
       });
     }
   } else {
     if (action === "add_main") {
       if (eventItem.players.includes(user.id)) {
-        return interaction.reply({
+        return interaction.editReply({
           content: "Этот игрок уже в основе.",
-          ephemeral: true,
         });
       }
 
       if (eventItem.players.length >= eventItem.limit) {
-        return interaction.reply({
+        return interaction.editReply({
           content: "Основа уже заполнена. Сначала убери кого-то или измени лимит.",
-          ephemeral: true,
         });
       }
 
@@ -1101,19 +1080,17 @@ async function handleRedaktCommand(interaction) {
       eventItem.players.push(user.id);
     } else if (action === "add_replace") {
       if (eventItem.replacements.includes(user.id)) {
-        return interaction.reply({
+        return interaction.editReply({
           content: "Этот игрок уже в замене.",
-          ephemeral: true,
         });
       }
 
       eventItem.players = eventItem.players.filter((id) => id !== user.id);
       eventItem.replacements.push(user.id);
     } else {
-      return interaction.reply({
+      return interaction.editReply({
         content:
           "Для обычной стрелы используй `add_main`, `add_replace` или `remove`.",
-        ephemeral: true,
       });
     }
   }
@@ -1123,22 +1100,22 @@ async function handleRedaktCommand(interaction) {
     .catch(() => null);
 
   if (!targetMessage) {
-    return interaction.reply({
+    saveActiveEvents();
+
+    return interaction.editReply({
       content:
         "Состав изменён в памяти бота, но я не смог найти сообщение для обновления.",
-      ephemeral: true,
     });
   }
 
   await updateEventMessage(targetMessage, eventItem);
 
-  return interaction.reply({
+  return interaction.editReply({
     content: `Состав обновлён для <@${user.id}>.`,
-    ephemeral: true,
   });
 }
 
-client.on("messageCreate", async (message) => {
+client.on(Events.MessageCreate, async (message) => {
   if (message.author.bot) return;
   if (!message.guild) return;
 
@@ -1159,393 +1136,409 @@ client.on("messageCreate", async (message) => {
   }
 });
 
-client.on("interactionCreate", async (interaction) => {
-  if (interaction.isChatInputCommand()) {
-    if (interaction.commandName === "redakt") {
-      return handleRedaktCommand(interaction);
-    }
+client.on(Events.InteractionCreate, async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand()) {
+      if (interaction.commandName === "redakt") {
+        return handleRedaktCommand(interaction);
+      }
 
-    if (interaction.commandName === "ch") {
-      if (
-        !interaction.memberPermissions.has(
-          PermissionsBitField.Flags.Administrator
-        )
-      ) {
+      if (interaction.commandName === "ch") {
+        if (
+          !interaction.memberPermissions.has(
+            PermissionsBitField.Flags.Administrator
+          )
+        ) {
+          return interaction.reply({
+            content: "Добавлять в ЧС может только администратор.",
+            ephemeral: true,
+          });
+        }
+
+        const server = interaction.options.getString("server");
+        const user = interaction.options.getUser("user");
+
+        addToBlacklist(server, user.id);
+
         return interaction.reply({
-          content: "Добавлять в ЧС может только администратор.",
+          content: `<@${user.id}> добавлен в ЧС сервера **${server}**.`,
           ephemeral: true,
         });
       }
 
-      const server = interaction.options.getString("server");
-      const user = interaction.options.getUser("user");
+      if (interaction.commandName === "unch") {
+        if (
+          !interaction.memberPermissions.has(
+            PermissionsBitField.Flags.Administrator
+          )
+        ) {
+          return interaction.reply({
+            content: "Убирать из ЧС может только администратор.",
+            ephemeral: true,
+          });
+        }
 
-      addToBlacklist(server, user.id);
+        const server = interaction.options.getString("server");
+        const user = interaction.options.getUser("user");
 
-      return interaction.reply({
-        content: `<@${user.id}> добавлен в ЧС сервера **${server}**.`,
-        ephemeral: true,
-      });
-    }
+        removeFromBlacklist(server, user.id);
 
-    if (interaction.commandName === "unch") {
-      if (
-        !interaction.memberPermissions.has(
-          PermissionsBitField.Flags.Administrator
-        )
-      ) {
         return interaction.reply({
-          content: "Убирать из ЧС может только администратор.",
+          content: `<@${user.id}> убран из ЧС сервера **${server}**.`,
           ephemeral: true,
         });
       }
 
-      const server = interaction.options.getString("server");
-      const user = interaction.options.getUser("user");
+      if (interaction.commandName === "antidel") {
+        if (
+          !interaction.memberPermissions.has(
+            PermissionsBitField.Flags.Administrator
+          )
+        ) {
+          return interaction.reply({
+            content: "Команда /antidel доступна только администраторам.",
+            ephemeral: true,
+          });
+        }
 
-      removeFromBlacklist(server, user.id);
+        const current = isAntiDeleteEnabled(
+          interaction.guild.id,
+          interaction.channel.id
+        );
 
-      return interaction.reply({
-        content: `<@${user.id}> убран из ЧС сервера **${server}**.`,
-        ephemeral: true,
-      });
-    }
+        setAntiDelete(interaction.guild.id, interaction.channel.id, !current);
 
-    if (interaction.commandName === "antidel") {
-      if (
-        !interaction.memberPermissions.has(
-          PermissionsBitField.Flags.Administrator
-        )
-      ) {
         return interaction.reply({
-          content: "Команда /antidel доступна только администраторам.",
+          content: !current
+            ? "Автоудаление сообщений в этом канале включено."
+            : "Автоудаление сообщений в этом канале выключено.",
           ephemeral: true,
         });
       }
 
-      const current = isAntiDeleteEnabled(
-        interaction.guild.id,
-        interaction.channel.id
-      );
+      if (interaction.commandName === "fw") {
+        const timeText = interaction.options.getString("time");
+        const against = interaction.options.getString("against");
+        const eventDate = parseEventTime(timeText);
 
-      setAntiDelete(interaction.guild.id, interaction.channel.id, !current);
+        if (!eventDate) {
+          return interaction.reply({
+            content: "Время должно быть в формате `21:30`.",
+            ephemeral: true,
+          });
+        }
 
-      return interaction.reply({
-        content: !current
-          ? "Автоудаление сообщений в этом канале включено."
-          : "Автоудаление сообщений в этом канале выключено.",
-        ephemeral: true,
-      });
-    }
+        const eventItem = {
+          type: "fw",
+          mode: "special",
+          server: null,
+          limit: null,
+          timeText,
+          eventDate,
+          against,
+          organizations: null,
+          picked: [],
+          players: [],
+          replacements: [],
+          specialPlayers: [],
+          createdById: interaction.user.id,
+          createdByTag: interaction.user.tag,
+          guildId: interaction.guild.id,
+          channelId: interaction.channel.id,
+          fullFiveNotified: false,
+          creatorTwoHourNotified: false,
+          creatorTwoHourReminderScheduled: false,
+          tenMinuteNotified: false,
+          tenMinuteReminderScheduled: false,
+        };
 
-    if (interaction.commandName === "fw") {
-      const timeText = interaction.options.getString("time");
-      const against = interaction.options.getString("against");
-      const eventDate = parseEventTime(timeText);
-
-      if (!eventDate) {
-        return interaction.reply({
-          content: "Время должно быть в формате `21:30`.",
-          ephemeral: true,
-        });
+        return createSlashSlotEvent(interaction, eventItem);
       }
 
-      const eventItem = {
-        type: "fw",
-        mode: "special",
-        server: null,
-        limit: null,
-        timeText,
-        eventDate,
-        against,
-        organizations: null,
-        picked: [],
-        players: [],
-        replacements: [],
-        specialPlayers: [],
-        createdById: interaction.user.id,
-        createdByTag: interaction.user.tag,
-        guildId: interaction.guild.id,
-        channelId: interaction.channel.id,
-      };
+      if (interaction.commandName === "neft") {
+        const organizations = interaction.options.getString("organizations");
+        const server = interaction.options.getString("server");
 
-      return createSlashSlotEvent(interaction, eventItem);
+        const eventItem = {
+          type: "neft",
+          mode: "special",
+          server,
+          limit: null,
+          timeText: null,
+          eventDate: null,
+          against: null,
+          organizations,
+          picked: [],
+          players: [],
+          replacements: [],
+          specialPlayers: [],
+          createdById: interaction.user.id,
+          createdByTag: interaction.user.tag,
+          guildId: interaction.guild.id,
+          channelId: interaction.channel.id,
+          fullFiveNotified: false,
+          creatorTwoHourNotified: false,
+          creatorTwoHourReminderScheduled: false,
+          tenMinuteNotified: false,
+          tenMinuteReminderScheduled: false,
+        };
+
+        return createSlashSlotEvent(interaction, eventItem);
+      }
+
+      if (interaction.commandName === "priton") {
+        const organizations = interaction.options.getString("organizations");
+        const server = interaction.options.getString("server");
+
+        const eventItem = {
+          type: "priton",
+          mode: "special",
+          server,
+          limit: null,
+          timeText: null,
+          eventDate: null,
+          against: null,
+          organizations,
+          picked: [],
+          players: [],
+          replacements: [],
+          specialPlayers: [],
+          createdById: interaction.user.id,
+          createdByTag: interaction.user.tag,
+          guildId: interaction.guild.id,
+          channelId: interaction.channel.id,
+          fullFiveNotified: false,
+          creatorTwoHourNotified: false,
+          creatorTwoHourReminderScheduled: false,
+          tenMinuteNotified: false,
+          tenMinuteReminderScheduled: false,
+        };
+
+        return createSlashSlotEvent(interaction, eventItem);
+      }
     }
 
-    if (interaction.commandName === "neft") {
-      const organizations = interaction.options.getString("organizations");
-      const server = interaction.options.getString("server");
+    if (!interaction.isButton()) return;
 
-      const eventItem = {
-        type: "neft",
-        mode: "special",
-        server,
-        limit: null,
-        timeText: null,
-        eventDate: null,
-        against: null,
-        organizations,
-        picked: [],
-        players: [],
-        replacements: [],
-        specialPlayers: [],
-        createdById: interaction.user.id,
-        createdByTag: interaction.user.tag,
-        guildId: interaction.guild.id,
-        channelId: interaction.channel.id,
-      };
+    await interaction.deferReply({ ephemeral: true });
 
-      return createSlashSlotEvent(interaction, eventItem);
-    }
+    const eventItem = strely.get(interaction.message.id);
 
-    if (interaction.commandName === "priton") {
-      const organizations = interaction.options.getString("organizations");
-      const server = interaction.options.getString("server");
-
-      const eventItem = {
-        type: "priton",
-        mode: "special",
-        server,
-        limit: null,
-        timeText: null,
-        eventDate: null,
-        against: null,
-        organizations,
-        picked: [],
-        players: [],
-        replacements: [],
-        specialPlayers: [],
-        createdById: interaction.user.id,
-        createdByTag: interaction.user.tag,
-        guildId: interaction.guild.id,
-        channelId: interaction.channel.id,
-      };
-
-      return createSlashSlotEvent(interaction, eventItem);
-    }
-  }
-
-  if (!interaction.isButton()) return;
-
-  const eventItem = strely.get(interaction.message.id);
-
-  if (!eventItem) {
-    return interaction.reply({
-      content: "Эта запись уже неактивна.",
-      ephemeral: true,
-    });
-  }
-
-  const userId = interaction.user.id;
-
-  if (eventItem.server && isBlacklisted(eventItem.server, userId)) {
-    return interaction.reply({
-      content: `Ты находишься в ЧС сервера **${eventItem.server}** и не можешь пикать эти слоты.`,
-      ephemeral: true,
-    });
-  }
-
-  if (interaction.customId === "special_no_set") {
-    setSpecialPlayerStatus(eventItem, userId, "без сета");
-
-    await updateEventMessage(interaction.message, eventItem);
-
-    return interaction.reply({
-      content: "Ты пикнул слот без сета.",
-      ephemeral: true,
-    });
-  }
-
-  if (interaction.customId === "special_with_set") {
-    setSpecialPlayerStatus(eventItem, userId, "с сетом");
-
-    await updateEventMessage(interaction.message, eventItem);
-
-    return interaction.reply({
-      content: "Ты пикнул слот с сетом.",
-      ephemeral: true,
-    });
-  }
-
-  if (interaction.customId === "special_set_paid") {
-    setSpecialPlayerStatus(eventItem, userId, "сет оплачен");
-
-    await updateEventMessage(interaction.message, eventItem);
-
-    return interaction.reply({
-      content: "Отмечено: сет оплачен.",
-      ephemeral: true,
-    });
-  }
-
-  if (interaction.customId === "decide_pick") {
-    if (eventItem.picked.includes(userId)) {
-      return interaction.reply({
-        content: "Ты уже пикнул слот.",
-        ephemeral: true,
-      });
-    }
-
-    eventItem.picked.push(userId);
-
-    await notifyCreatorAboutFive(eventItem);
-    await updateEventMessage(interaction.message, eventItem);
-
-    return interaction.reply({
-      content: "Ты пикнул слот.",
-      ephemeral: true,
-    });
-  }
-
-  if (interaction.customId === "decide_unpick") {
-    const minutesLeft = minutesBeforeEvent(eventItem);
-
-    if (minutesLeft < 20) {
-      return interaction.reply({
+    if (!eventItem) {
+      return interaction.editReply({
         content:
-          "Нельзя отпикнуть слот, если до события осталось меньше 20 минут.",
-        ephemeral: true,
+          "Эта запись не найдена в памяти бота. Скорее всего она была создана на старой версии кода до фикса. Создай запись заново.",
       });
     }
 
-    if (!eventItem.picked.includes(userId)) {
-      return interaction.reply({
-        content: "Ты не пикал слот.",
-        ephemeral: true,
+    const userId = interaction.user.id;
+
+    if (eventItem.server && isBlacklisted(eventItem.server, userId)) {
+      return interaction.editReply({
+        content: `Ты находишься в ЧС сервера **${eventItem.server}** и не можешь пикать эти слоты.`,
       });
     }
 
-    eventItem.picked = eventItem.picked.filter((id) => id !== userId);
-
-    await updateEventMessage(interaction.message, eventItem);
-
-    return interaction.reply({
-      content: "Ты отпикнул слот.",
-      ephemeral: true,
-    });
-  }
-
-  if (interaction.customId.startsWith("format_")) {
-    if (interaction.user.id !== eventItem.createdById) {
-      return interaction.reply({
-        content: "Выбрать формат может только человек, который создал эти слоты.",
-        ephemeral: true,
-      });
-    }
-
-    const limit = Number(interaction.customId.replace("format_", ""));
-
-    eventItem.mode = "normal";
-    eventItem.limit = limit;
-    eventItem.players = eventItem.picked.slice(0, limit);
-    eventItem.replacements = eventItem.picked.slice(limit);
-
-    await updateEventMessage(interaction.message, eventItem);
-
-    return interaction.reply({
-      content: `Формат выбран: ${limit}/${limit}. Первые ${limit} игроков пошли в основу, остальные — на замену.`,
-      ephemeral: true,
-    });
-  }
-
-  if (interaction.customId === "pick_slot") {
-    if (eventItem.players.includes(userId)) {
-      return interaction.reply({
-        content: "Ты уже в основном слоте.",
-        ephemeral: true,
-      });
-    }
-
-    if (eventItem.replacements.includes(userId)) {
-      eventItem.replacements = eventItem.replacements.filter(
-        (id) => id !== userId
-      );
-    }
-
-    if (eventItem.players.length >= eventItem.limit) {
-      return interaction.reply({
-        content: "Основные слоты уже заполнены. Можешь стать на замену.",
-        ephemeral: true,
-      });
-    }
-
-    eventItem.players.push(userId);
-
-    await updateEventMessage(interaction.message, eventItem);
-
-    return interaction.reply({
-      content: "Ты занял слот.",
-      ephemeral: true,
-    });
-  }
-
-  if (interaction.customId === "unpick_slot") {
-    const minutesLeft = minutesBeforeEvent(eventItem);
-
-    if (minutesLeft < 20) {
-      return interaction.reply({
-        content:
-          "Нельзя отпикнуть слот, если до события осталось меньше 20 минут.",
-        ephemeral: true,
-      });
-    }
-
-    if (eventItem.players.includes(userId)) {
-      eventItem.players = eventItem.players.filter((id) => id !== userId);
-
-      await promoteFirstReplacement(eventItem);
+    if (interaction.customId === "special_no_set") {
+      setSpecialPlayerStatus(eventItem, userId, "без сета");
 
       await updateEventMessage(interaction.message, eventItem);
 
-      return interaction.reply({
-        content: "Ты отпикнул основной слот.",
-        ephemeral: true,
+      return interaction.editReply({
+        content: "Ты пикнул слот без сета.",
       });
     }
 
-    if (eventItem.replacements.includes(userId)) {
-      eventItem.replacements = eventItem.replacements.filter(
-        (id) => id !== userId
-      );
+    if (interaction.customId === "special_with_set") {
+      setSpecialPlayerStatus(eventItem, userId, "с сетом");
 
       await updateEventMessage(interaction.message, eventItem);
 
-      return interaction.reply({
-        content: "Ты отпикнул замену.",
-        ephemeral: true,
+      return interaction.editReply({
+        content: "Ты пикнул слот с сетом.",
       });
     }
 
-    return interaction.reply({
-      content: "Ты не записан в эти слоты.",
-      ephemeral: true,
+    if (interaction.customId === "special_set_paid") {
+      setSpecialPlayerStatus(eventItem, userId, "сет оплачен");
+
+      await updateEventMessage(interaction.message, eventItem);
+
+      return interaction.editReply({
+        content: "Отмечено: сет оплачен.",
+      });
+    }
+
+    if (interaction.customId === "decide_pick") {
+      if (eventItem.picked.includes(userId)) {
+        return interaction.editReply({
+          content: "Ты уже пикнул слот.",
+        });
+      }
+
+      eventItem.picked.push(userId);
+
+      await notifyCreatorAboutFive(eventItem);
+      await updateEventMessage(interaction.message, eventItem);
+
+      return interaction.editReply({
+        content: "Ты пикнул слот.",
+      });
+    }
+
+    if (interaction.customId === "decide_unpick") {
+      const minutesLeft = minutesBeforeEvent(eventItem);
+
+      if (minutesLeft < 20) {
+        return interaction.editReply({
+          content:
+            "Нельзя отпикнуть слот, если до события осталось меньше 20 минут.",
+        });
+      }
+
+      if (!eventItem.picked.includes(userId)) {
+        return interaction.editReply({
+          content: "Ты не пикал слот.",
+        });
+      }
+
+      eventItem.picked = eventItem.picked.filter((id) => id !== userId);
+
+      await updateEventMessage(interaction.message, eventItem);
+
+      return interaction.editReply({
+        content: "Ты отпикнул слот.",
+      });
+    }
+
+    if (interaction.customId.startsWith("format_")) {
+      if (interaction.user.id !== eventItem.createdById) {
+        return interaction.editReply({
+          content: "Выбрать формат может только человек, который создал эти слоты.",
+        });
+      }
+
+      const limit = Number(interaction.customId.replace("format_", ""));
+
+      eventItem.mode = "normal";
+      eventItem.limit = limit;
+      eventItem.players = eventItem.picked.slice(0, limit);
+      eventItem.replacements = eventItem.picked.slice(limit);
+
+      await updateEventMessage(interaction.message, eventItem);
+
+      return interaction.editReply({
+        content: `Формат выбран: ${limit}/${limit}. Первые ${limit} игроков пошли в основу, остальные — на замену.`,
+      });
+    }
+
+    if (interaction.customId === "pick_slot") {
+      if (eventItem.players.includes(userId)) {
+        return interaction.editReply({
+          content: "Ты уже в основном слоте.",
+        });
+      }
+
+      if (eventItem.replacements.includes(userId)) {
+        eventItem.replacements = eventItem.replacements.filter(
+          (id) => id !== userId
+        );
+      }
+
+      if (eventItem.players.length >= eventItem.limit) {
+        return interaction.editReply({
+          content: "Основные слоты уже заполнены. Можешь стать на замену.",
+        });
+      }
+
+      eventItem.players.push(userId);
+
+      await updateEventMessage(interaction.message, eventItem);
+
+      return interaction.editReply({
+        content: "Ты занял слот.",
+      });
+    }
+
+    if (interaction.customId === "unpick_slot") {
+      const minutesLeft = minutesBeforeEvent(eventItem);
+
+      if (minutesLeft < 20) {
+        return interaction.editReply({
+          content:
+            "Нельзя отпикнуть слот, если до события осталось меньше 20 минут.",
+        });
+      }
+
+      if (eventItem.players.includes(userId)) {
+        eventItem.players = eventItem.players.filter((id) => id !== userId);
+
+        await promoteFirstReplacement(eventItem);
+
+        await updateEventMessage(interaction.message, eventItem);
+
+        return interaction.editReply({
+          content: "Ты отпикнул основной слот.",
+        });
+      }
+
+      if (eventItem.replacements.includes(userId)) {
+        eventItem.replacements = eventItem.replacements.filter(
+          (id) => id !== userId
+        );
+
+        await updateEventMessage(interaction.message, eventItem);
+
+        return interaction.editReply({
+          content: "Ты отпикнул замену.",
+        });
+      }
+
+      return interaction.editReply({
+        content: "Ты не записан в эти слоты.",
+      });
+    }
+
+    if (interaction.customId === "replacement_slot") {
+      if (eventItem.players.includes(userId)) {
+        return interaction.editReply({
+          content: "Ты уже в основном слоте.",
+        });
+      }
+
+      if (eventItem.replacements.includes(userId)) {
+        return interaction.editReply({
+          content: "Ты уже записан на замену.",
+        });
+      }
+
+      eventItem.replacements.push(userId);
+
+      await updateEventMessage(interaction.message, eventItem);
+
+      return interaction.editReply({
+        content: "Ты записан на замену.",
+      });
+    }
+
+    return interaction.editReply({
+      content: "Неизвестная кнопка.",
     });
-  }
+  } catch (error) {
+    console.error("Ошибка interactionCreate:", error);
 
-  if (interaction.customId === "replacement_slot") {
-    if (eventItem.players.includes(userId)) {
-      return interaction.reply({
-        content: "Ты уже в основном слоте.",
-        ephemeral: true,
-      });
+    if (interaction.isRepliable()) {
+      await safeEditReply(interaction, "Произошла ошибка, но бот не упал. Проверь консоль.");
     }
-
-    if (eventItem.replacements.includes(userId)) {
-      return interaction.reply({
-        content: "Ты уже записан на замену.",
-        ephemeral: true,
-      });
-    }
-
-    eventItem.replacements.push(userId);
-
-    await updateEventMessage(interaction.message, eventItem);
-
-    return interaction.reply({
-      content: "Ты записан на замену.",
-      ephemeral: true,
-    });
   }
+});
+
+process.on("unhandledRejection", (error) => {
+  console.error("Unhandled Rejection:", error);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error);
 });
 
 client.login(process.env.DISCORD_TOKEN);
