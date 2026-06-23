@@ -12,6 +12,7 @@ const {
   PermissionsBitField,
   ApplicationCommandOptionType,
   Events,
+  MessageFlags,
 } = require("discord.js");
 
 const DATA_FILE = "./data.json";
@@ -43,6 +44,7 @@ function loadData() {
     data.activeEvents = loaded.activeEvents || {};
   } catch (error) {
     console.log("Ошибка чтения data.json:", error);
+
     data = {
       blacklist: {},
       antiDeleteChannels: {},
@@ -87,16 +89,6 @@ function restoreActiveEvents() {
   }
 
   console.log(`Восстановлено активных записей: ${strely.size}`);
-}
-
-function deleteActiveEvent(messageId) {
-  strely.delete(messageId);
-
-  if (data.activeEvents) {
-    delete data.activeEvents[messageId];
-  }
-
-  saveData();
 }
 
 loadData();
@@ -243,6 +235,40 @@ client.once(Events.ClientReady, async () => {
 
   console.log("Slash-команды зарегистрированы");
 });
+
+function ephemeralReply(content) {
+  return {
+    content,
+    flags: MessageFlags.Ephemeral,
+  };
+}
+
+async function safeDeferReply(interaction) {
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    return true;
+  } catch (error) {
+    console.log("Не удалось сделать deferReply:", error.message);
+    return false;
+  }
+}
+
+async function safeEditReply(interaction, content) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      return await interaction.editReply({ content });
+    }
+
+    return await interaction.reply(ephemeralReply(content));
+  } catch (error) {
+    console.log("Не удалось ответить на interaction:", error.message);
+  }
+}
 
 function hasAdmin(member) {
   return member.permissions.has(PermissionsBitField.Flags.Administrator);
@@ -575,21 +601,6 @@ async function updateEventMessage(message, eventItem) {
   saveActiveEvents();
 }
 
-async function safeEditReply(interaction, content) {
-  try {
-    if (interaction.deferred || interaction.replied) {
-      return await interaction.editReply({ content });
-    }
-
-    return await interaction.reply({
-      content,
-      ephemeral: true,
-    });
-  } catch (error) {
-    console.log("Не удалось ответить на interaction:", error.message);
-  }
-}
-
 async function promoteFirstReplacement(eventItem) {
   if (eventItem.replacements.length === 0) return null;
 
@@ -652,7 +663,7 @@ function scheduleCreatorTwoHourReminder(eventItem) {
       const user = await client.users.fetch(eventItem.createdById);
 
       await user.send(
-        `До стрелы на сервере **${eventItem.server}** осталось 2 часа.\nПикнувших людей: **${eventItem.picked.length}**.\nЗайди и выбери формат 2/2, 3/3, 4/4 или 5/5, чтобы закрыть пик слотов.`
+        `До стрелы на сервере **${eventItem.server}** осталось 2 часа.\nПикнувших людей: **${eventItem.picked.length}**.\nЗайди и выбери формат 2/2, 3/3, 4/4 или 5/5.`
       );
     } catch (error) {
       console.log(`Не удалось отправить ЛС создателю ${eventItem.createdById}`);
@@ -727,7 +738,6 @@ async function sendHelp(message) {
       "```",
       "",
       "**!strela 2** — когда вам забили стрелу, и сначала нужно понять сколько людей пойдёт.",
-      "Создатель выбирает формат 2/2, 3/3, 4/4 или 5/5.",
       "```text",
       "!strela 2",
       "Сервер: Gilbert",
@@ -736,22 +746,14 @@ async function sendHelp(message) {
       "Время: 21:30",
       "```",
       "",
-      "**/fw** — пик слотов на ФВ. Поля: `time`, `against`.",
-      "**/neft** — пик слотов на нефтевышки. Поля: `organizations`, `server`.",
-      "**/priton** — пик слотов на притон. Поля: `organizations`, `server`.",
-      "",
-      "Для `/fw`, `/neft`, `/priton` кнопки:",
-      "`ПИКНУТЬ СЛОТ (БЕЗ СЕТА)`",
-      "`ПИКНУТЬ СЛОТ (С СЕТОМ)`",
-      "`СЕТ ОПЛАЧЕН`",
-      "",
-      "**/redakt** — редактировать состав созданной тобой метки/вышки/ФВ/притона.",
-      "Действия: `add_main`, `add_replace`, `add_no_set`, `add_with_set`, `set_paid`, `remove`.",
-      "",
-      "**!limit число** — изменить лимит в обычной стреле. Нужно ответить на сообщение бота.",
+      "**/fw** — пик слотов на ФВ.",
+      "**/neft** — пик слотов на нефтевышки.",
+      "**/priton** — пик слотов на притон.",
+      "**/redakt** — редактировать состав.",
+      "**!limit число** — изменить лимит, ответив на сообщение бота.",
       "**/ch** — добавить игрока в ЧС сервера.",
       "**/unch** — убрать игрока из ЧС сервера.",
-      "**/antidel** — включить/выключить автоудаление сообщений в канале.",
+      "**/antidel** — включить/выключить автоудаление сообщений.",
     ].join("\n")
   );
 }
@@ -789,7 +791,7 @@ async function handleLimitCommand(message) {
 
   if (isSpecialEvent(eventItem)) {
     return message.reply(
-      "Для `/fw`, `/neft`, `/priton` лимита нет, там не нужна команда `!limit`."
+      "Для `/fw`, `/neft`, `/priton` лимита нет."
     );
   }
 
@@ -823,7 +825,7 @@ async function handleCreateStrela(message) {
   if (isDecideMode) {
     if (!server || !map || !weapon || !timeText) {
       return message.reply(
-        "Неправильная форма. Используй так:\n\n```text\n!strela 2\nСервер: Gilbert\nКарта: SF\nОружие: AK-47\nВремя: 21:30\n```"
+        "Неправильная форма:\n```text\n!strela 2\nСервер: Gilbert\nКарта: SF\nОружие: AK-47\nВремя: 21:30\n```"
       );
     }
 
@@ -876,7 +878,7 @@ async function handleCreateStrela(message) {
 
   if (!server || !limitText || !map || !weapon || !timeText) {
     return message.reply(
-      "Неправильная форма. Используй так:\n\n```text\n!strela\nСервер: Gilbert\nКоличество людей: 5\nКарта: SF\nОружие: AK-47\nВремя: 21:30\n```"
+      "Неправильная форма:\n```text\n!strela\nСервер: Gilbert\nКоличество людей: 5\nКарта: SF\nОружие: AK-47\nВремя: 21:30\n```"
     );
   }
 
@@ -930,14 +932,14 @@ async function handleCreateStrela(message) {
 }
 
 async function createSlashSlotEvent(interaction, eventItem) {
+  const deferred = await safeDeferReply(interaction);
+  if (!deferred) return;
+
   if (!hasDeputyOrHigher(interaction.member)) {
-    return interaction.reply({
+    return interaction.editReply({
       content: "Создавать слоты может только роль deputy или выше.",
-      ephemeral: true,
     });
   }
-
-  await interaction.deferReply({ ephemeral: true });
 
   const sentMessage = await interaction.channel.send({
     embeds: [buildEmbed(eventItem)],
@@ -1010,7 +1012,8 @@ function findEditableEvent(interaction, messageId) {
 }
 
 async function handleRedaktCommand(interaction) {
-  await interaction.deferReply({ ephemeral: true });
+  const deferred = await safeDeferReply(interaction);
+  if (!deferred) return;
 
   const action = interaction.options.getString("action");
   const user = interaction.options.getUser("user");
@@ -1116,23 +1119,27 @@ async function handleRedaktCommand(interaction) {
 }
 
 client.on(Events.MessageCreate, async (message) => {
-  if (message.author.bot) return;
-  if (!message.guild) return;
+  try {
+    if (message.author.bot) return;
+    if (!message.guild) return;
 
-  if (message.content === "!help") {
-    return sendHelp(message);
-  }
+    if (message.content === "!help") {
+      return sendHelp(message);
+    }
 
-  if (message.content.startsWith("!limit")) {
-    return handleLimitCommand(message);
-  }
+    if (message.content.startsWith("!limit")) {
+      return handleLimitCommand(message);
+    }
 
-  if (message.content.startsWith("!strela")) {
-    return handleCreateStrela(message);
-  }
+    if (message.content.startsWith("!strela")) {
+      return handleCreateStrela(message);
+    }
 
-  if (isAntiDeleteEnabled(message.guild.id, message.channel.id)) {
-    await message.delete().catch(() => {});
+    if (isAntiDeleteEnabled(message.guild.id, message.channel.id)) {
+      await message.delete().catch(() => {});
+    }
+  } catch (error) {
+    console.error("Ошибка messageCreate:", error);
   }
 });
 
@@ -1144,14 +1151,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (interaction.commandName === "ch") {
+        const deferred = await safeDeferReply(interaction);
+        if (!deferred) return;
+
         if (
           !interaction.memberPermissions.has(
             PermissionsBitField.Flags.Administrator
           )
         ) {
-          return interaction.reply({
+          return interaction.editReply({
             content: "Добавлять в ЧС может только администратор.",
-            ephemeral: true,
           });
         }
 
@@ -1160,21 +1169,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         addToBlacklist(server, user.id);
 
-        return interaction.reply({
+        return interaction.editReply({
           content: `<@${user.id}> добавлен в ЧС сервера **${server}**.`,
-          ephemeral: true,
         });
       }
 
       if (interaction.commandName === "unch") {
+        const deferred = await safeDeferReply(interaction);
+        if (!deferred) return;
+
         if (
           !interaction.memberPermissions.has(
             PermissionsBitField.Flags.Administrator
           )
         ) {
-          return interaction.reply({
+          return interaction.editReply({
             content: "Убирать из ЧС может только администратор.",
-            ephemeral: true,
           });
         }
 
@@ -1183,21 +1193,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         removeFromBlacklist(server, user.id);
 
-        return interaction.reply({
+        return interaction.editReply({
           content: `<@${user.id}> убран из ЧС сервера **${server}**.`,
-          ephemeral: true,
         });
       }
 
       if (interaction.commandName === "antidel") {
+        const deferred = await safeDeferReply(interaction);
+        if (!deferred) return;
+
         if (
           !interaction.memberPermissions.has(
             PermissionsBitField.Flags.Administrator
           )
         ) {
-          return interaction.reply({
+          return interaction.editReply({
             content: "Команда /antidel доступна только администраторам.",
-            ephemeral: true,
           });
         }
 
@@ -1208,11 +1219,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         setAntiDelete(interaction.guild.id, interaction.channel.id, !current);
 
-        return interaction.reply({
+        return interaction.editReply({
           content: !current
             ? "Автоудаление сообщений в этом канале включено."
             : "Автоудаление сообщений в этом канале выключено.",
-          ephemeral: true,
         });
       }
 
@@ -1222,10 +1232,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         const eventDate = parseEventTime(timeText);
 
         if (!eventDate) {
-          return interaction.reply({
-            content: "Время должно быть в формате `21:30`.",
-            ephemeral: true,
-          });
+          return interaction.reply(
+            ephemeralReply("Время должно быть в формате `21:30`.")
+          );
         }
 
         const eventItem = {
@@ -1320,14 +1329,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (!interaction.isButton()) return;
 
-    await interaction.deferReply({ ephemeral: true });
+    const deferred = await safeDeferReply(interaction);
+    if (!deferred) return;
 
     const eventItem = strely.get(interaction.message.id);
 
     if (!eventItem) {
       return interaction.editReply({
         content:
-          "Эта запись не найдена в памяти бота. Скорее всего она была создана на старой версии кода до фикса. Создай запись заново.",
+          "Эта запись не найдена в памяти бота. Если она была создана на старом коде — создай запись заново.",
       });
     }
 
@@ -1341,7 +1351,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.customId === "special_no_set") {
       setSpecialPlayerStatus(eventItem, userId, "без сета");
-
       await updateEventMessage(interaction.message, eventItem);
 
       return interaction.editReply({
@@ -1351,7 +1360,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.customId === "special_with_set") {
       setSpecialPlayerStatus(eventItem, userId, "с сетом");
-
       await updateEventMessage(interaction.message, eventItem);
 
       return interaction.editReply({
@@ -1361,7 +1369,6 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (interaction.customId === "special_set_paid") {
       setSpecialPlayerStatus(eventItem, userId, "сет оплачен");
-
       await updateEventMessage(interaction.message, eventItem);
 
       return interaction.editReply({
@@ -1528,9 +1535,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     console.error("Ошибка interactionCreate:", error);
 
     if (interaction.isRepliable()) {
-      await safeEditReply(interaction, "Произошла ошибка, но бот не упал. Проверь консоль.");
+      await safeEditReply(
+        interaction,
+        "Произошла ошибка, но бот не упал. Проверь консоль."
+      );
     }
   }
+});
+
+client.on("error", (error) => {
+  console.error("Client error:", error);
 });
 
 process.on("unhandledRejection", (error) => {
