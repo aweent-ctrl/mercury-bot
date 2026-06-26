@@ -28,12 +28,14 @@ const client = new Client({
 const strely = new Map();
 const scheduledTenMinute = new Set();
 const scheduledCreatorTwoHour = new Set();
+const scheduledStats = new Set();
 
 let data = {
   blacklist: {},
   antiDeleteChannels: {},
   slotAdmins: {},
   activeEvents: {},
+  stats: {},
 };
 
 function loadData() {
@@ -46,6 +48,7 @@ function loadData() {
     data.antiDeleteChannels = loaded.antiDeleteChannels || {};
     data.slotAdmins = loaded.slotAdmins || {};
     data.activeEvents = loaded.activeEvents || {};
+    data.stats = loaded.stats || {};
   } catch (error) {
     console.log("Ошибка чтения data.json:", error);
 
@@ -54,6 +57,7 @@ function loadData() {
       antiDeleteChannels: {},
       slotAdmins: {},
       activeEvents: {},
+      stats: {},
     };
   }
 }
@@ -66,6 +70,45 @@ function saveData() {
   } catch (error) {
     console.log("Ошибка сохранения data.json:", error);
   }
+}
+
+function normalizeSlotAdmins(guildId) {
+  const raw = data.slotAdmins[guildId];
+
+  if (!raw) {
+    data.slotAdmins[guildId] = [];
+    return [];
+  }
+
+  if (Array.isArray(raw)) {
+    data.slotAdmins[guildId] = raw.map((id) => String(id));
+    return data.slotAdmins[guildId];
+  }
+
+  if (typeof raw === "object") {
+    data.slotAdmins[guildId] = Object.keys(raw)
+      .filter((id) => raw[id])
+      .map((id) => String(id));
+
+    return data.slotAdmins[guildId];
+  }
+
+  data.slotAdmins[guildId] = [];
+  return [];
+}
+
+function normalizeStats(guildId) {
+  if (!data.stats[guildId]) {
+    data.stats[guildId] = {
+      mainSlots: {},
+    };
+  }
+
+  if (!data.stats[guildId].mainSlots) {
+    data.stats[guildId].mainSlots = {};
+  }
+
+  return data.stats[guildId];
 }
 
 function normalizeEvent(eventItem) {
@@ -94,6 +137,10 @@ function normalizeEvent(eventItem) {
 
   if (typeof eventItem.tenMinuteNotified !== "boolean") {
     eventItem.tenMinuteNotified = false;
+  }
+
+  if (typeof eventItem.statsCounted !== "boolean") {
+    eventItem.statsCounted = false;
   }
 
   return eventItem;
@@ -182,6 +229,10 @@ client.once(Events.ClientReady, async () => {
             required: true,
           },
         ],
+      },
+      {
+        name: "static",
+        description: "Показать статистику, сколько раз люди были в основе на стреле",
       },
       {
         name: "ch",
@@ -315,6 +366,7 @@ client.once(Events.ClientReady, async () => {
   for (const [messageId] of strely.entries()) {
     scheduleCreatorTwoHourReminder(messageId);
     scheduleTenMinuteReminder(messageId);
+    scheduleStatsCount(messageId);
   }
 
   console.log("Slash-команды зарегистрированы");
@@ -331,12 +383,11 @@ function isUnknownInteractionError(error) {
   return error && Number(error.code) === 10062;
 }
 
-async function safeDeferReply(interaction) {
+async function safeDeferReply(interaction, ephemeral = true) {
   try {
     if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply({
-        flags: EPHEMERAL_FLAG,
-      });
+      const options = ephemeral ? { flags: EPHEMERAL_FLAG } : {};
+      await interaction.deferReply(options);
     }
 
     return true;
@@ -373,38 +424,73 @@ async function safeEditReply(interaction, content) {
 }
 
 function hasAdmin(member) {
-  return member.permissions.has(PermissionsBitField.Flags.Administrator);
+  try {
+    if (!member) return false;
+
+    if (member.permissions && typeof member.permissions.has === "function") {
+      return member.permissions.has(PermissionsBitField.Flags.Administrator);
+    }
+
+    return false;
+  } catch (error) {
+    return false;
+  }
 }
 
-function hasSlotCreatorAccess(member) {
-  if (!member) return false;
+function interactionHasAdmin(interaction) {
+  try {
+    if (
+      interaction.memberPermissions &&
+      interaction.memberPermissions.has(PermissionsBitField.Flags.Administrator)
+    ) {
+      return true;
+    }
+
+    return hasAdmin(interaction.member);
+  } catch (error) {
+    return false;
+  }
+}
+
+function isSlotAdmin(guildId, userId) {
+  const list = normalizeSlotAdmins(String(guildId));
+  return list.includes(String(userId));
+}
+
+function hasSlotCreatorAccess(member, guildId, userId) {
+  if (!guildId || !userId) return false;
   if (hasAdmin(member)) return true;
 
-  const guildId = member.guild.id;
-  const list = data.slotAdmins[guildId] || [];
+  return isSlotAdmin(guildId, userId);
+}
 
-  return list.includes(member.id);
+function interactionHasSlotCreatorAccess(interaction) {
+  if (interactionHasAdmin(interaction)) return true;
+
+  return isSlotAdmin(interaction.guild.id, interaction.user.id);
 }
 
 function addSlotAdmin(guildId, userId) {
-  if (!data.slotAdmins[guildId]) {
-    data.slotAdmins[guildId] = [];
+  const guildKey = String(guildId);
+  const userKey = String(userId);
+
+  const list = normalizeSlotAdmins(guildKey);
+
+  if (!list.includes(userKey)) {
+    list.push(userKey);
   }
 
-  if (!data.slotAdmins[guildId].includes(userId)) {
-    data.slotAdmins[guildId].push(userId);
-  }
-
+  data.slotAdmins[guildKey] = list;
   saveData();
 }
 
 function removeSlotAdmin(guildId, userId) {
-  if (!data.slotAdmins[guildId]) return;
+  const guildKey = String(guildId);
+  const userKey = String(userId);
 
-  data.slotAdmins[guildId] = data.slotAdmins[guildId].filter(
-    (id) => id !== userId
-  );
+  const list = normalizeSlotAdmins(guildKey);
 
+  data.slotAdmins[guildKey] = list.filter((id) => id !== userKey);
   saveData();
 }
 
@@ -760,6 +846,65 @@ async function updateEventMessage(message, eventItem) {
 
   saveEvent(message.id, eventItem);
   scheduleTenMinuteReminder(message.id);
+  scheduleStatsCount(message.id);
+}
+
+function addMainStats(guildId, userId) {
+  const guildStats = normalizeStats(String(guildId));
+
+  const key = String(userId);
+
+  if (!guildStats.mainSlots[key]) {
+    guildStats.mainSlots[key] = 0;
+  }
+
+  guildStats.mainSlots[key] += 1;
+}
+
+function countStatsForEvent(messageId) {
+  const eventItem = getEvent(messageId);
+
+  if (!eventItem) return;
+  if (eventItem.statsCounted) return;
+  if (eventItem.type !== "strela") return;
+  if (eventItem.mode !== "normal") return;
+  if (!Array.isArray(eventItem.players) || eventItem.players.length === 0) return;
+
+  const uniquePlayers = [...new Set(eventItem.players)];
+
+  for (const userId of uniquePlayers) {
+    addMainStats(eventItem.guildId, userId);
+  }
+
+  eventItem.statsCounted = true;
+  saveEvent(messageId, eventItem);
+
+  console.log(`Статистика записана для стрелы ${messageId}`);
+}
+
+function scheduleStatsCount(messageId) {
+  const eventItem = getEvent(messageId);
+
+  if (!eventItem) return;
+  if (!eventItem.eventDate) return;
+  if (eventItem.statsCounted) return;
+  if (eventItem.type !== "strela") return;
+
+  const delay = eventItem.eventDate.getTime() - Date.now();
+
+  if (delay <= 0) {
+    countStatsForEvent(messageId);
+    return;
+  }
+
+  if (scheduledStats.has(messageId)) return;
+
+  scheduledStats.add(messageId);
+
+  setTimeout(() => {
+    scheduledStats.delete(messageId);
+    countStatsForEvent(messageId);
+  }, delay);
 }
 
 async function promoteFirstReplacement(messageId, eventItem) {
@@ -832,7 +977,7 @@ function scheduleCreatorTwoHourReminder(messageId) {
       const user = await client.users.fetch(latest.createdById);
 
       await user.send(
-        `До стрелы на сервере **${latest.server}** осталось 2 часа.\nПикнувших людей: **${latest.picked.length}**.\nВремя: **${latest.timeText} МСК**.\nЗайди и выбери формат 2/2, 3/3, 4/4 или 5/5.`
+        `До стрелы на сервере **${latest.server}** осталось 2 часа.\nПикнувших людей: **${latest.picked.length}**.\nВремя: **${latest.timeText} МСК**.\nСервер: **${latest.server || "не указан"}**.\nЗайди и выбери формат 2/2, 3/3, 4/4 или 5/5.`
       );
     } catch (error) {
       console.log(`Не удалось отправить ЛС создателю ${latest.createdById}`);
@@ -892,6 +1037,7 @@ async function runTenMinuteReminder(messageId) {
 
   const title = getEventTitle(latest);
   const timeText = latest.timeText ? `${latest.timeText} МСК` : "не указано";
+  const serverText = latest.server || "не указан";
   const mentions = userIds.map((id) => `<@${id}>`).join(" ");
 
   for (const userId of userIds) {
@@ -899,7 +1045,7 @@ async function runTenMinuteReminder(messageId) {
       const user = await client.users.fetch(userId);
 
       await user.send(
-        `⏰ Напоминание: через 10 минут будет стрела.\n\n${title}\nВремя: ${timeText}`
+        `⏰ Напоминание: через 10 минут будет стрела.\n\n${title}\nВремя: ${timeText}\nСервер: ${serverText}`
       );
     } catch (error) {
       console.log(`Не удалось отправить ЛС пользователю ${userId}`);
@@ -914,7 +1060,8 @@ async function runTenMinuteReminder(messageId) {
         content:
           `⏰ ${mentions}\n` +
           `Через 10 минут будет **${title}**.\n` +
-          `Время: **${timeText}**.`,
+          `Время: **${timeText}**.\n` +
+          `Сервер: **${serverText}**.`,
         allowedMentions: {
           users: userIds,
         },
@@ -935,6 +1082,7 @@ async function sendHelp(message) {
       "",
       "**/adm @user** — выдать пользователю доступ к запуску слотов.",
       "**/unadm @user** — забрать доступ к запуску слотов.",
+      "**/static** — статистика, сколько раз люди были в основе на стреле.",
       "",
       "**!strela** — обычная стрела с лимитом людей.",
       "```text",
@@ -1039,11 +1187,18 @@ function createBaseStrelaEvent(message, server, map, weapon, timeText, eventDate
     fullFiveNotified: false,
     creatorTwoHourNotified: false,
     tenMinuteNotified: false,
+    statsCounted: false,
   };
 }
 
 async function handleCreateStrela(message) {
-  if (!hasSlotCreatorAccess(message.member)) {
+  if (
+    !hasSlotCreatorAccess(
+      message.member,
+      message.guild.id,
+      message.author.id
+    )
+  ) {
     return message.reply(
       "У тебя нет доступа к запуску слотов. Администратор должен выдать доступ командой `/adm @user`."
     );
@@ -1095,6 +1250,7 @@ async function handleCreateStrela(message) {
     setAntiDelete(message.guild.id, message.channel.id, true);
     scheduleCreatorTwoHourReminder(sentMessage.id);
     scheduleTenMinuteReminder(sentMessage.id);
+    scheduleStatsCount(sentMessage.id);
 
     return;
   }
@@ -1140,10 +1296,11 @@ async function handleCreateStrela(message) {
 
   setAntiDelete(message.guild.id, message.channel.id, true);
   scheduleTenMinuteReminder(sentMessage.id);
+  scheduleStatsCount(sentMessage.id);
 }
 
 async function createSlashSlotEvent(interaction, eventItem) {
-  if (!hasSlotCreatorAccess(interaction.member)) {
+  if (!interactionHasSlotCreatorAccess(interaction)) {
     return interaction.editReply({
       content:
         "У тебя нет доступа к запуску слотов. Администратор должен выдать доступ командой `/adm @user`.",
@@ -1159,6 +1316,7 @@ async function createSlashSlotEvent(interaction, eventItem) {
 
   setAntiDelete(interaction.guild.id, interaction.channel.id, true);
   scheduleTenMinuteReminder(sentMessage.id);
+  scheduleStatsCount(sentMessage.id);
 
   return interaction.editReply({
     content: "Слоты созданы.",
@@ -1238,7 +1396,7 @@ async function handleRedaktCommand(interaction) {
 
   const { eventItem } = found;
 
-  if (eventItem.createdById !== interaction.user.id && !hasAdmin(interaction.member)) {
+  if (eventItem.createdById !== interaction.user.id && !interactionHasAdmin(interaction)) {
     return interaction.editReply({
       content:
         "Редактировать состав может только человек, который создал эти слоты, или администратор.",
@@ -1332,7 +1490,7 @@ async function handleAdmCommand(interaction) {
   const deferred = await safeDeferReply(interaction);
   if (!deferred) return;
 
-  if (!hasAdmin(interaction.member)) {
+  if (!interactionHasAdmin(interaction)) {
     return interaction.editReply({
       content: "Команда `/adm` доступна только администраторам сервера.",
     });
@@ -1343,7 +1501,9 @@ async function handleAdmCommand(interaction) {
   addSlotAdmin(interaction.guild.id, user.id);
 
   return interaction.editReply({
-    content: `<@${user.id}> теперь может запускать слоты.`,
+    content:
+      `<@${user.id}> теперь может запускать слоты.\n` +
+      `Проверка: ID сохранён в список доступа этого сервера.`,
   });
 }
 
@@ -1351,7 +1511,7 @@ async function handleUnadmCommand(interaction) {
   const deferred = await safeDeferReply(interaction);
   if (!deferred) return;
 
-  if (!hasAdmin(interaction.member)) {
+  if (!interactionHasAdmin(interaction)) {
     return interaction.editReply({
       content: "Команда `/unadm` доступна только администраторам сервера.",
     });
@@ -1366,11 +1526,51 @@ async function handleUnadmCommand(interaction) {
   });
 }
 
+async function handleStaticCommand(interaction) {
+  const deferred = await safeDeferReply(interaction, false);
+  if (!deferred) return;
+
+  const guildId = String(interaction.guild.id);
+  const guildStats = normalizeStats(guildId);
+  const entries = Object.entries(guildStats.mainSlots || {}).sort(
+    (a, b) => b[1] - a[1]
+  );
+
+  if (entries.length === 0) {
+    return interaction.editReply({
+      content:
+        "Статистика пока пустая. Она начнёт заполняться после завершения новых стрел.",
+    });
+  }
+
+  const lines = entries.map(([userId, count], index) => {
+    return `**${index + 1}.** <@${userId}> — **${count}** раз(а) в основе`;
+  });
+
+  let content = "**Статистика основы на стрелах:**\n\n" + lines.join("\n");
+
+  if (content.length > 1900) {
+    content =
+      "**Статистика основы на стрелах:**\n\n" +
+      lines.slice(0, 40).join("\n") +
+      "\n\nПоказаны первые 40 человек.";
+  }
+
+  return interaction.editReply({
+    content,
+    allowedMentions: {
+      users: [],
+      roles: [],
+      parse: [],
+    },
+  });
+}
+
 async function handleChCommand(interaction) {
   const deferred = await safeDeferReply(interaction);
   if (!deferred) return;
 
-  if (!hasAdmin(interaction.member)) {
+  if (!interactionHasAdmin(interaction)) {
     return interaction.editReply({
       content: "Добавлять в ЧС может только администратор.",
     });
@@ -1390,7 +1590,7 @@ async function handleUnchCommand(interaction) {
   const deferred = await safeDeferReply(interaction);
   if (!deferred) return;
 
-  if (!hasAdmin(interaction.member)) {
+  if (!interactionHasAdmin(interaction)) {
     return interaction.editReply({
       content: "Убирать из ЧС может только администратор.",
     });
@@ -1410,7 +1610,7 @@ async function handleAntidelCommand(interaction) {
   const deferred = await safeDeferReply(interaction);
   if (!deferred) return;
 
-  if (!hasAdmin(interaction.member)) {
+  if (!interactionHasAdmin(interaction)) {
     return interaction.editReply({
       content: "Команда `/antidel` доступна только администраторам.",
     });
@@ -1464,6 +1664,7 @@ async function handleFwCommand(interaction) {
     fullFiveNotified: false,
     creatorTwoHourNotified: false,
     tenMinuteNotified: false,
+    statsCounted: false,
   };
 
   return createSlashSlotEvent(interaction, eventItem);
@@ -1496,6 +1697,7 @@ async function handleNeftCommand(interaction) {
     fullFiveNotified: false,
     creatorTwoHourNotified: false,
     tenMinuteNotified: false,
+    statsCounted: false,
   };
 
   return createSlashSlotEvent(interaction, eventItem);
@@ -1528,6 +1730,7 @@ async function handlePritonCommand(interaction) {
     fullFiveNotified: false,
     creatorTwoHourNotified: false,
     tenMinuteNotified: false,
+    statsCounted: false,
   };
 
   return createSlashSlotEvent(interaction, eventItem);
@@ -1567,6 +1770,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       if (interaction.commandName === "unadm") {
         return handleUnadmCommand(interaction);
+      }
+
+      if (interaction.commandName === "static") {
+        return handleStaticCommand(interaction);
       }
 
       if (interaction.commandName === "redakt") {
@@ -1693,7 +1900,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
 
     if (interaction.customId.startsWith("format_")) {
-      if (interaction.user.id !== eventItem.createdById && !hasAdmin(interaction.member)) {
+      if (interaction.user.id !== eventItem.createdById && !interactionHasAdmin(interaction)) {
         return interaction.editReply({
           content:
             "Выбрать формат может только человек, который создал эти слоты, или администратор.",
